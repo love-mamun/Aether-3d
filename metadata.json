@@ -1,0 +1,6 @@
+{
+  "name": "Aether 3D",
+  "description": "Screen-aware multitasking 3D holographic voice AI agent powered by Gemini and local SQLite.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
