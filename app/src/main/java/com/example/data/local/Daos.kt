@@ -11,6 +11,9 @@ interface CommandLogDao {
     @Query("SELECT * FROM command_logs ORDER BY timestamp DESC LIMIT 100")
     fun observeRecentLogs(): Flow<List<CommandLogEntity>>
 
+    @Query("SELECT * FROM command_logs ORDER BY timestamp DESC LIMIT :limit")
+    suspend fun getRecentLogsSnapshot(limit: Int = 20): List<CommandLogEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertLog(log: CommandLogEntity): Long
 
@@ -26,7 +29,7 @@ interface MemoryNoteDao {
     @Query("SELECT * FROM memory_notes ORDER BY isPinned DESC, createdAt DESC")
     fun observeAllMemories(): Flow<List<MemoryNoteEntity>>
 
-    @Query("SELECT * FROM memory_notes ORDER BY isPinned DESC, createdAt DESC LIMIT 20")
+    @Query("SELECT * FROM memory_notes ORDER BY isPinned DESC, createdAt DESC LIMIT 40")
     suspend fun getTopMemoriesSnapshot(): List<MemoryNoteEntity>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)

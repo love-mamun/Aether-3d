@@ -11,6 +11,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.unit.dp
 import androidx.test.core.app.ApplicationProvider
@@ -158,7 +159,7 @@ class ExampleRobolectricTest {
             CommandLogEntity(
                 userPrompt = "Turn on flashlight",
                 assistantReply = "Flashlight enabled",
-                personaUsed = "JARVIS",
+                personaUsed = "AETHER",
                 sourceMode = "FOREGROUND",
                 hadScreenVision = false,
                 tasksSummary = "Flashlight On: DONE",
@@ -183,7 +184,7 @@ class ExampleRobolectricTest {
 
         // Preferences
         val savedPrefs = vault.loadPreferences().copy(
-            persona = AssistantPersona.MAX,
+            persona = AssistantPersona.ARIA,
             speechLocale = SpeechLocaleOption.BN_BD,
             continuousLoopEnabled = true
         )
@@ -193,20 +194,20 @@ class ExampleRobolectricTest {
         assertTrue(vault.getTopMemories().any { it.content.contains("4590") })
         assertTrue(vault.getContactsSnapshot().any { it.aliasName == "Mom" && it.phoneNumber == "+919876543210" })
         assertTrue(vault.getRoutinesSnapshot().any { it.triggerPhrase == "Gym Mode" && it.usageCount >= 1 })
-        assertEquals(AssistantPersona.MAX, reloadedPrefs.persona)
+        assertEquals(AssistantPersona.ARIA, reloadedPrefs.persona)
         assertEquals(SpeechLocaleOption.BN_BD, reloadedPrefs.speechLocale)
         assertEquals(2, SpeechLocaleOption.entries.size)
         assertTrue(reloadedPrefs.continuousLoopEnabled)
     }
 
     @Test
-    fun `permissions manager reports all nine capabilities and valid intents`() {
+    fun `permissions manager reports all eleven capabilities and valid intents`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val manager = PermissionsManager(context)
         val snapshot = manager.checkSnapshot()
 
-        assertEquals(9, snapshot.totalCount)
-        assertEquals(9, snapshot.toItemList().size)
+        assertEquals(11, snapshot.totalCount)
+        assertEquals(11, snapshot.toItemList().size)
         assertTrue(manager.runtimePermissionsToRequest().isNotEmpty())
         assertEquals(
             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -258,7 +259,7 @@ class ExampleRobolectricTest {
         )
 
         composeRule.setContent {
-            Aether3DTheme(persona = AssistantPersona.JARVIS) {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
                 androidx.compose.foundation.layout.Column {
                     TopTelemetryBar(
                         uiState = state,
@@ -277,9 +278,9 @@ class ExampleRobolectricTest {
                         audioAmplitudeFlow = ampFlow,
                         onMicClick = { micClicks++ },
                         onSubmitText = { submittedCmd = it },
-                        onVisualScanClick = {},
                         onToggleBackgroundService = {},
-                        onToggleTts = {}
+                        onToggleTts = {},
+                        onOpenSettings = {}
                     )
                 }
             }
@@ -287,6 +288,7 @@ class ExampleRobolectricTest {
 
         composeRule.onNodeWithTag("persona_cycle_button").assertIsDisplayed().performClick()
         composeRule.onNodeWithTag("mic_button").assertIsDisplayed().performClick()
+        composeRule.onNodeWithTag("bottom_settings_button").assertIsDisplayed()
         composeRule.onNodeWithTag("command_input").assertIsDisplayed()
         composeRule.onNodeWithText("3D Avatar online and standing by.").assertIsDisplayed()
 
@@ -359,10 +361,10 @@ class ExampleRobolectricTest {
     fun `human cartoon avatar renders with accessibility test tag for personas`() {
         val ampFlow = MutableStateFlow(0.55f)
         composeRule.setContent {
-            Aether3DTheme(persona = AssistantPersona.MAYRA) {
+            Aether3DTheme(persona = AssistantPersona.ARIA) {
                 com.example.ui.components.HumanCartoonAvatar(
                     coreMode = CoreMode.SPEAKING,
-                    persona = AssistantPersona.MAYRA,
+                    persona = AssistantPersona.ARIA,
                     audioAmplitudeFlow = ampFlow,
                     headYawDeg = 8f,
                     headPitchDeg = -4f,
@@ -432,12 +434,12 @@ class ExampleRobolectricTest {
         var savedPrimary = false
 
         composeRule.setContent {
-            Aether3DTheme(persona = AssistantPersona.JARVIS) {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
                 com.example.ui.components.NvidiaApiDialog(
                     preferences = com.example.data.local.AssistantPreferences(),
                     isConfigured = false,
                     onDismiss = {},
-                    onSave = { k, m, p ->
+                    onSave = { k, m, p, gk, gm ->
                         savedKey = k
                         savedModel = m
                         savedPrimary = p
@@ -445,7 +447,9 @@ class ExampleRobolectricTest {
                             vault.loadPreferences().copy(
                                 nvidiaApiKey = k,
                                 nvidiaModel = m,
-                                preferNvidiaPrimary = p
+                                preferNvidiaPrimary = p,
+                                geminiApiKey = gk,
+                                geminiModel = gm
                             )
                         )
                         currentKey = k
@@ -657,21 +661,21 @@ class ExampleRobolectricTest {
         val inline = com.example.system.WakeWordDetector.match(
             transcript = "Hey Aether, turn on flashlight",
             customWakeWord = "Hey Aether",
-            persona = AssistantPersona.JARVIS
+            persona = AssistantPersona.AETHER
         )
         assertNotNull(inline)
         assertEquals("turn on flashlight", inline?.trailingCommand)
 
         val bangla = com.example.system.WakeWordDetector.match(
             transcript = "হে এথার আমাকে সময় বলো",
-            persona = AssistantPersona.MAYRA
+            persona = AssistantPersona.ARIA
         )
         assertNotNull(bangla)
         assertEquals("আমাকে সময় বলো", bangla?.trailingCommand)
 
         val bare = com.example.system.WakeWordDetector.match(
-            transcript = "hey max",
-            persona = AssistantPersona.MAX
+            transcript = "hey aria",
+            persona = AssistantPersona.ARIA
         )
         assertNotNull(bare)
         assertEquals("", bare?.trailingCommand)
@@ -710,7 +714,7 @@ class ExampleRobolectricTest {
         )
 
         composeRule.setContent {
-            Aether3DTheme(persona = AssistantPersona.JARVIS) {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
                 val scrollState = androidx.compose.foundation.rememberScrollState()
                 androidx.compose.foundation.layout.Column(
                     modifier = androidx.compose.ui.Modifier.verticalScroll(scrollState)
@@ -819,13 +823,12 @@ class ExampleRobolectricTest {
         assertEquals(android.media.AudioAttributes.CONTENT_TYPE_SPEECH, attrs.contentType)
 
         val piper = com.example.voice.PiperNeuralVoiceManager(context)
-        assertEquals(3, piper.catalog.size)
-        piper.catalog.forEach { pack ->
-            assertTrue("Expected pack under 25 MB, got ${pack.downloadSizeMb}", pack.downloadSizeMb < 25f)
+        assertEquals(6, piper.catalog.size)
+        piper.catalog.filter { it.downloadUrl.isNotBlank() }.forEach { pack ->
+            assertTrue("Expected pack under 120 MB, got ${pack.downloadSizeMb}", pack.downloadSizeMb < 120f)
             assertTrue(pack.downloadUrl.startsWith("https://"))
         }
-        assertEquals(3, piper.packStates.value.size)
-        assertTrue(piper.packStates.value.all { it.status == com.example.voice.VoicePackStatus.NOT_INSTALLED })
+        assertEquals(6, piper.packStates.value.size)
     }
 
     @Test
@@ -932,7 +935,7 @@ class ExampleRobolectricTest {
         var engineSelected = ""
 
         composeRule.setContent {
-            Aether3DTheme(persona = AssistantPersona.JARVIS) {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
                 com.example.ui.components.VoiceStudioContent(
                     uiState = state,
                     onClose = null,
@@ -959,7 +962,7 @@ class ExampleRobolectricTest {
         var speakBriefingClicked = 0
 
         composeRule.setContent {
-            Aether3DTheme(persona = AssistantPersona.JARVIS) {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
                 com.example.ui.components.VaultWorkspaceContent(
                     logs = emptyList(),
                     memories = emptyList(),
@@ -996,5 +999,399 @@ class ExampleRobolectricTest {
         composeRule.onNodeWithTag("vault_tab_macros").performScrollTo().performClick()
         composeRule.waitForIdle()
         composeRule.onNodeWithTag("toggle_macro_recording_button").assertIsDisplayed()
+    }
+
+    @Test
+    fun `voice isolation dsp attenuates sub-bass rumble and segments clear human voice`() {
+        val caps = com.example.audio.AudioEffectCapabilities(
+            aecState = com.example.audio.AudioEffectState.UNSUPPORTED,
+            nsState = com.example.audio.AudioEffectState.UNSUPPORTED,
+            agcState = com.example.audio.AudioEffectState.UNSUPPORTED
+        )
+        assertTrue(caps.softwareNoiseSuppressionBoostNeeded)
+        assertTrue(caps.softwareAgcBoostNeeded)
+        assertTrue(caps.softwareEchoSuppressionActive)
+
+        val dsp = com.example.audio.VoiceIsolationDsp(
+            sampleRateHz = 16_000,
+            frameSamples = 320,
+            hardwareCapabilities = caps
+        )
+
+        // Feed 15 frames of 60 Hz sub-bass / speaker rumble -> should be strongly attenuated and NOT trigger speech
+        val subBassFrame = ShortArray(320) { i ->
+            (6000.0 * kotlin.math.sin(2.0 * kotlin.math.PI * 60.0 * i / 16_000.0)).toInt().toShort()
+        }
+        var lastRumbleRes: com.example.audio.DspFrameResult? = null
+        repeat(15) {
+            val res = dsp.processFrame(subBassFrame)
+            lastRumbleRes = res
+            assertEquals(null, dsp.feedForUtterance(res))
+        }
+        assertTrue("Expected sub-bass rumble to be attenuated", (lastRumbleRes?.filteredRms ?: 9999f) < 1200f)
+        assertFalse("Sub-bass rumble must not classify as speech", lastRumbleRes?.isSpeechFrame == true)
+
+        // Feed 35 frames (700 ms) of 650 Hz human voice-band tone followed by 50 frames (1000 ms) of quiet
+        val voiceFrame = ShortArray(320) { i ->
+            (4500.0 * kotlin.math.sin(2.0 * kotlin.math.PI * 650.0 * i / 16_000.0)).toInt().toShort()
+        }
+        val silenceFrame = ShortArray(320)
+        var detectedSpeechFrames = 0
+        repeat(35) {
+            val res = dsp.processFrame(voiceFrame)
+            if (res.isSpeechFrame) detectedSpeechFrames++
+            dsp.feedForUtterance(res)
+        }
+        assertTrue("Expected voice-band tone to trigger speech frames", detectedSpeechFrames >= 10)
+
+        var emittedUtterance: com.example.audio.CompletedUtterancePcm? = null
+        repeat(50) {
+            val res = dsp.processFrame(silenceFrame)
+            val seg = dsp.feedForUtterance(res)
+            if (seg != null) emittedUtterance = seg
+        }
+        assertNotNull("Expected VAD to emit completed filtered speech utterance", emittedUtterance)
+        assertTrue((emittedUtterance?.durationMs ?: 0L) >= 450L)
+    }
+
+    @Test
+    fun `audio wav encoder produces valid 16khz mono pcm header`() {
+        val samples = shortArrayOf(100, -200, 300, -400)
+        val wav = com.example.audio.AudioWavEncoder.encodePcm16MonoWav(samples, sampleRateHz = 16_000)
+        assertEquals(44 + samples.size * 2, wav.size)
+        assertEquals('R'.code.toByte(), wav[0])
+        assertEquals('I'.code.toByte(), wav[1])
+        assertEquals('F'.code.toByte(), wav[2])
+        assertEquals('F'.code.toByte(), wav[3])
+        assertEquals('W'.code.toByte(), wav[8])
+        assertEquals('A'.code.toByte(), wav[9])
+        assertEquals('V'.code.toByte(), wav[10])
+        assertEquals('E'.code.toByte(), wav[11])
+    }
+
+    @Test
+    fun `filtered microphone engine handles missing permission and voice studio renders filter card`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val router = com.example.system.CommunicationAudioRouter(context)
+        val engine = com.example.audio.FilteredMicrophoneEngine(context, router)
+
+        var capturedErr: String? = null
+        engine.startCapture(
+            continuousMode = false,
+            isEchoGuardSuppressed = { false },
+            onAmplitude = {},
+            onSpeechSegmentReady = {},
+            onCaptureError = { capturedErr = it }
+        )
+        assertFalse(engine.isCapturing)
+        assertNotNull(capturedErr)
+        engine.release()
+
+        var toggled = 0
+        val diagState = AssistantUiState(
+            audioFilterDiagnostics = com.example.audio.AudioFilterDiagnostics(
+                isCapturing = true,
+                effects = com.example.audio.AudioEffectCapabilities(
+                    aecState = com.example.audio.AudioEffectState.ACTIVE,
+                    nsState = com.example.audio.AudioEffectState.UNSUPPORTED,
+                    agcState = com.example.audio.AudioEffectState.ACTIVE
+                ),
+                noiseFloorDb = -48f,
+                voiceConfidence = 0.84f,
+                isSpeechDetected = true
+            )
+        )
+        composeRule.setContent {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
+                com.example.ui.components.VoiceStudioContent(
+                    uiState = diagState,
+                    onClose = null,
+                    onSelectEngineMode = {},
+                    onSelectBargeInMode = {},
+                    onToggleFilteredMic = { toggled++ },
+                    onDownloadPack = {},
+                    onSelectPack = {},
+                    onDeletePack = {},
+                    onTestSample = {},
+                    modifier = androidx.compose.ui.Modifier
+                        .fillMaxWidth()
+                        .height(480.dp)
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("audio_filter_diagnostics_card").assertIsDisplayed()
+        composeRule.onNodeWithText("Filtered Mic · AudioRecord (VOICE_COMMUNICATION)").assertIsDisplayed()
+        composeRule.onNodeWithTag("filtered_mic_switch").performClick()
+        assertEquals(1, toggled)
+    }
+
+    @Test
+    fun `weather pipeline localizes bangla forecast, uses 16s timeout, and replaces stale searching fallback`() {
+        val repo = FreeWebToolsRepository()
+        val sampleForecast = """
+            {
+              "current": {
+                "temperature_2m": 29.4,
+                "apparent_temperature": 33.0,
+                "relative_humidity_2m": 78,
+                "wind_speed_10m": 11.5,
+                "weather_code": 61
+              },
+              "daily": {
+                "temperature_2m_max": [31.2],
+                "temperature_2m_min": [24.5],
+                "precipitation_probability_max": [80],
+                "rain_sum": [6.4]
+              }
+            }
+        """.trimIndent()
+        val banglaForecast = repo.formatOpenMeteoForecast("Dhaka", sampleForecast, preferBangla = true)
+        assertTrue(banglaForecast.contains("Dhaka"))
+        assertTrue(banglaForecast.contains("29°C"))
+        assertTrue(banglaForecast.contains("বৃষ্টির সম্ভাবনা 80%"))
+
+        val dagExecutor = com.example.core.TaskDagExecutor()
+        val weatherStep = PlannedStep(
+            stepId = "w1",
+            actionType = ActionType.WEATHER_LOOKUP,
+            label = "Weather Lookup",
+            target = "current"
+        )
+        assertEquals(16_000L, dagExecutor.resolveTimeoutMs(weatherStep))
+        val dagNodes = dagExecutor.buildDag(listOf(weatherStep))
+
+        val fallback = com.example.core.AgentOrchestrator.resolvePipelineFallbackReply(
+            initialReply = "আবহাওয়া খুঁজে দিচ্ছি...",
+            dagNodes = dagNodes,
+            timedOutCount = 1,
+            failedCount = 0,
+            preferBangla = true,
+            webTools = repo
+        )
+        assertFalse(fallback.contains("খুঁজে দিচ্ছি"))
+        assertTrue(fallback.contains("আবহাওয়া") || fallback.contains("আবহাওয়া") || fallback.contains("দুঃখিত"))
+    }
+
+    @Test
+    fun `wake trigger mode policy enforces button-only idle zero mic and persists preference`() {
+        assertEquals(
+            com.example.system.EchoGuardPolicy.StandbyDecision.BUTTON_ONLY_IDLE,
+            com.example.system.EchoGuardPolicy.resolveBackgroundStandby(
+                wakeWordEnabled = true,
+                micGranted = true,
+                backgroundServicePaused = false,
+                filteredMicCapturing = false,
+                pauseWakeDuringMusic = true,
+                musicPlaybackActive = false,
+                isCoreIdle = true,
+                wakeTriggerMode = com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY
+            )
+        )
+        assertEquals(
+            com.example.system.EchoGuardPolicy.StandbyDecision.PAUSED_FOR_MUSIC,
+            com.example.system.EchoGuardPolicy.resolveBackgroundStandby(
+                wakeWordEnabled = true,
+                micGranted = true,
+                backgroundServicePaused = false,
+                filteredMicCapturing = false,
+                pauseWakeDuringMusic = true,
+                musicPlaybackActive = true,
+                isCoreIdle = true,
+                wakeTriggerMode = com.example.data.local.WakeTriggerMode.HYBRID_KWS_AND_BUTTON
+            )
+        )
+
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vault = VaultRepository(context)
+        vault.savePreferences(
+            vault.loadPreferences().copy(
+                wakeTriggerMode = com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY,
+                wakeWordEnabled = false
+            )
+        )
+        val reloaded = vault.loadPreferences()
+        assertEquals(com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY, reloaded.wakeTriggerMode)
+        assertFalse(reloaded.wakeWordEnabled)
+    }
+
+    @Test
+    fun `multi-step classifier separates multi-hop youtube workflow and parses subGoals`() {
+        val multiHopPrompt = "YouTube a novaking entertainment search kore channel a giye first video play koro"
+        assertTrue(com.example.core.MultiStepGoalClassifier.isMultiHopYouTubeWorkflow(multiHopPrompt))
+
+        val simplePlay = "play Despacito on YouTube"
+        assertFalse(com.example.core.MultiStepGoalClassifier.isMultiHopYouTubeWorkflow(simplePlay))
+
+        val json = """
+            {
+              "reply": "Opening YouTube to open Novaking Entertainment's first video.",
+              "needsScreenObservation": true,
+              "continueLoopAfterAction": true,
+              "subGoals": [
+                "Open YouTube",
+                "Search Novaking Entertainment",
+                "Open channel & Videos tab",
+                "Play first video"
+              ],
+              "steps": [
+                {
+                  "actionType": "LAUNCH_APP",
+                  "label": "Open YouTube",
+                  "target": "YouTube"
+                }
+              ]
+            }
+        """.trimIndent()
+        val plan = GeminiCommandService().parseCommandPlan(json)
+        assertEquals(4, plan.subGoals.size)
+        assertEquals("Open channel & Videos tab", plan.subGoals[2])
+        assertTrue(com.example.core.MultiStepGoalClassifier.isMultiHopAppWorkflow(multiHopPrompt, plan))
+    }
+
+    @Test
+    fun `react multi-step progress hud renders waiting indicator and vision chip`() {
+        val reActState = AssistantUiState(
+            coreMode = CoreMode.OBSERVING_SCREEN,
+            reActSubGoals = listOf("Open YouTube", "Search query", "Open Videos", "Play first video"),
+            reActActiveSubGoalIndex = 1,
+            reActWaitingForLoad = true,
+            screenVisionSourceLabel = "ScreenVision + OCR",
+            latestReply = "Opening Novaking Entertainment channel..."
+        )
+
+        composeRule.setContent {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
+                CoreStatusAndReplyOverlay(
+                    uiState = reActState,
+                    onAbortTasks = {},
+                    onConfirmSensitive = {},
+                    onDismissSensitive = {}
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("react_progress_card").assertIsDisplayed()
+        composeRule.onNodeWithTag("react_waiting_indicator").assertIsDisplayed()
+        composeRule.onNodeWithTag("screen_vision_source_chip").assertIsDisplayed()
+        composeRule.onNodeWithText("Waiting for screen to load...").assertIsDisplayed()
+    }
+
+    @Test
+    fun `settings hub wake mode selector and kws download card render interactively`() {
+        val settingsState = AssistantUiState(
+            coreMode = CoreMode.IDLE
+        )
+        var pickedMode: com.example.data.local.WakeTriggerMode? = null
+        var kwsClicked = 0
+
+        composeRule.setContent {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
+                com.example.ui.components.SettingsHubContent(
+                    uiState = settingsState,
+                    onDismiss = {},
+                    onSelectPersona = {},
+                    onToggleWakeWord = {},
+                    onUpdateWakeWordPhrase = {},
+                    onTogglePauseWakeDuringMusic = {},
+                    onToggleBargeIn = {},
+                    onToggleContinuousLoop = {},
+                    onToggleAutonomousMode = {},
+                    onSelectLocale = {},
+                    onOpenVoiceStudio = {},
+                    onOpenApiSettings = {},
+                    onOpenPermissions = {},
+                    onSelectWakeTriggerMode = { pickedMode = it },
+                    onDownloadKwsPack = { kwsClicked++ },
+                    modifier = androidx.compose.ui.Modifier
+                        .fillMaxWidth()
+                        .height(900.dp)
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("settings_hub_sheet")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("kws_pack_download_button"))
+        composeRule.onNodeWithTag("kws_pack_download_button").performClick()
+        assertEquals(1, kwsClicked)
+
+        composeRule.onNodeWithTag("settings_hub_sheet")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("wake_mode_assistant_button_only"))
+        composeRule.onNodeWithTag("wake_mode_assistant_button_only").performClick()
+        assertEquals(com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY, pickedMode)
+    }
+
+    @Test
+    fun `vault persists offline vision token mode and cumulative token savings`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vault = VaultRepository(context)
+        vault.savePreferences(
+            vault.loadPreferences().copy(
+                visionTokenMode = com.example.data.local.VisionTokenMode.HYBRID_COMPACT,
+                estimatedTokensSavedTotal = 4250L
+            )
+        )
+        val reloaded = vault.loadPreferences()
+        assertEquals(com.example.data.local.VisionTokenMode.HYBRID_COMPACT, reloaded.visionTokenMode)
+        assertEquals(4250L, reloaded.estimatedTokensSavedTotal)
+    }
+
+    @Test
+    fun `hud chrome and settings hub display offline vision mode and token savings telemetry`() {
+        val prefs = com.example.data.local.AssistantPreferences(
+            visionTokenMode = com.example.data.local.VisionTokenMode.OFFLINE_FIRST,
+            estimatedTokensSavedTotal = 3100L
+        )
+        val hudState = AssistantUiState(
+            preferences = prefs,
+            coreMode = CoreMode.OBSERVING_SCREEN,
+            screenVisionSourceLabel = "OFFLINE (<50MB)",
+            estimatedTokensSavedSession = 1240L
+        )
+        var selectedMode: com.example.data.local.VisionTokenMode? = null
+
+        composeRule.setContent {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
+                androidx.compose.foundation.layout.Column {
+                    CoreStatusAndReplyOverlay(
+                        uiState = hudState,
+                        onAbortTasks = {},
+                        onConfirmSensitive = {},
+                        onDismissSensitive = {}
+                    )
+                    com.example.ui.components.SettingsHubContent(
+                        uiState = hudState,
+                        onDismiss = {},
+                        onSelectPersona = {},
+                        onToggleWakeWord = {},
+                        onUpdateWakeWordPhrase = {},
+                        onTogglePauseWakeDuringMusic = {},
+                        onToggleBargeIn = {},
+                        onToggleContinuousLoop = {},
+                        onToggleAutonomousMode = {},
+                        onSelectLocale = {},
+                        onOpenVoiceStudio = {},
+                        onOpenApiSettings = {},
+                        onOpenPermissions = {},
+                        onSelectVisionTokenMode = { selectedMode = it },
+                        modifier = androidx.compose.ui.Modifier
+                            .fillMaxWidth()
+                            .height(600.dp)
+                    )
+                }
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("tokens_saved_chip").assertIsDisplayed()
+        composeRule.onNodeWithTag("screen_vision_source_chip").assertIsDisplayed()
+
+        composeRule.onNodeWithTag("settings_hub_sheet")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("vision_mode_hybrid_compact"))
+        composeRule.onNodeWithTag("settings_tokens_saved_label").assertIsDisplayed()
+        composeRule.onNodeWithTag("vision_mode_hybrid_compact").performClick()
+        assertEquals(com.example.data.local.VisionTokenMode.HYBRID_COMPACT, selectedMode)
     }
 }

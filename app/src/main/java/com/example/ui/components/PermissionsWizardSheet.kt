@@ -68,7 +68,9 @@ fun PermissionsWizardSheet(
     onToggleBiometricVaultLock: () -> Unit = {},
     onSelectLocale: (SpeechLocaleOption) -> Unit,
     onOpenNvidiaApiSettings: () -> Unit = {},
-    onOpenVoiceStudio: () -> Unit = {}
+    onOpenVoiceStudio: () -> Unit = {},
+    onToggleDeepScreenVision: () -> Unit = {},
+    onRequestDefaultAssistant: () -> Unit = { onLaunchSpecialSettings("assistant_role") }
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val accent = MaterialTheme.colorScheme.primary
@@ -183,14 +185,16 @@ fun PermissionsWizardSheet(
                 Spacer(Modifier.height(4.dp))
                 HorizontalDivider(color = accent.copy(alpha = 0.2f))
                 Spacer(Modifier.height(8.dp))
-                Text(
-                    text = "AI ENGINE & NVIDIA NIM API",
-                    style = MaterialTheme.typography.titleMedium,
-                    color = accent
-                )
+                    Text(
+                        text = "AI ENGINES · GEMINI & NVIDIA",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = accent
+                    )
                 Spacer(Modifier.height(6.dp))
-                val keySet = uiState.isNvidiaConfigured || uiState.preferences.nvidiaApiKey.isNotBlank()
-                val directMode = keySet && uiState.preferences.preferNvidiaPrimary
+                val keySet = uiState.isNvidiaConfigured || uiState.preferences.nvidiaApiKey.isNotBlank() ||
+                    uiState.isGeminiKeyConfigured || uiState.preferences.geminiApiKey.isNotBlank()
+                val directMode = uiState.preferences.preferNvidiaPrimary &&
+                    (uiState.isNvidiaConfigured || uiState.preferences.nvidiaApiKey.isNotBlank())
                 Surface(
                     color = SmokedGlass,
                     shape = RoundedCornerShape(14.dp),
@@ -209,22 +213,23 @@ fun PermissionsWizardSheet(
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Key,
-                            contentDescription = "Configure NVIDIA API Key",
+                            contentDescription = "Configure Gemini & NVIDIA API Keys",
                             tint = if (keySet) StealthEmerald else SolarGold,
                             modifier = Modifier.size(20.dp)
                         )
                         Spacer(Modifier.width(12.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "NVIDIA NIM API & Key",
+                                text = "Gemini & NVIDIA API Keys",
                                 style = MaterialTheme.typography.titleSmall,
                                 color = HudTextPrimary
                             )
                             Text(
                                 text = when {
-                                    directMode -> "Primary AI (${uiState.preferences.nvidiaModel})"
-                                    keySet -> "Active via Secrets/In-App (${uiState.preferences.nvidiaModel})"
-                                    else -> "Tap to enter nvapi-... key directly in app"
+                                    directMode -> "NVIDIA Primary · Gemini Fallback (${uiState.preferences.nvidiaModel})"
+                                    uiState.isGeminiKeyConfigured -> "Custom Gemini Key (${uiState.preferences.geminiModel})"
+                                    keySet -> "Gemini Main · NVIDIA Fallback (${uiState.preferences.nvidiaModel})"
+                                    else -> "Tap to enter Gemini or NVIDIA API key"
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = HudTextSecondary
@@ -232,7 +237,7 @@ fun PermissionsWizardSheet(
                         }
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.OpenInNew,
-                            contentDescription = "Edit NVIDIA API settings",
+                            contentDescription = "Edit API settings",
                             tint = accent,
                             modifier = Modifier.size(18.dp)
                         )
@@ -271,9 +276,9 @@ fun PermissionsWizardSheet(
                             )
                             Text(
                                 text = if (readyPackCount > 0) {
-                                    "$readyPackCount Piper pack installed · Mode: ${uiState.preferences.bargeInMode}"
+                                    "$readyPackCount Piper pack active (${uiState.piperEngineStatus})"
                                 } else {
-                                    "Download compact < 25 MB human English voice & configure AEC"
+                                    "Preparing bundled Piper neural voice & echo shield"
                                 },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = HudTextSecondary
@@ -298,7 +303,7 @@ fun PermissionsWizardSheet(
             item {
                 ToggleRow(
                     title = "Wake Word (\"${uiState.preferences.customWakeWord}\")",
-                    subtitle = "Passively listen for \"Hey Aether / Jarvis\" and trigger commands hands-free",
+                    subtitle = "Passively listen for \"Hey Aether\" or \"Aria\" and activate hands-free",
                     checked = uiState.preferences.wakeWordEnabled,
                     onCheckedChange = { onToggleWakeWord() },
                     tag = "wake_word_switch"
@@ -338,6 +343,61 @@ fun PermissionsWizardSheet(
                     onCheckedChange = { onToggleSplitScreen() },
                     tag = "split_screen_switch"
                 )
+                ToggleRow(
+                    title = "Deep Screen Vision (MediaProjection Fallback)",
+                    subtitle = "Optional pixel capture fallback when apps block Accessibility screenshots",
+                    checked = uiState.isDeepVisionActive,
+                    onCheckedChange = { onToggleDeepScreenVision() },
+                    tag = "wizard_deep_vision_switch"
+                )
+                Spacer(Modifier.height(6.dp))
+                Surface(
+                    color = SmokedGlass,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(
+                        1.dp,
+                        if (uiState.isDefaultAssistant) StealthEmerald.copy(alpha = 0.55f) else accent.copy(alpha = 0.35f)
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("wizard_default_assistant_card")
+                        .clickable(onClick = onRequestDefaultAssistant)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = if (uiState.isDefaultAssistant) Icons.Filled.CheckCircle else Icons.Filled.RadioButtonUnchecked,
+                            contentDescription = "Default Digital Assistant Status",
+                            tint = if (uiState.isDefaultAssistant) StealthEmerald else SolarGold,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Default Digital Assistant Role",
+                                style = MaterialTheme.typography.titleSmall,
+                                color = HudTextPrimary
+                            )
+                            Text(
+                                text = if (uiState.isDefaultAssistant) {
+                                    "Active — summon Aether via OS corner/power assistant trigger"
+                                } else {
+                                    "Tap to set Aether as your system Default Assistant"
+                                },
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = HudTextSecondary
+                            )
+                        }
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.OpenInNew,
+                            contentDescription = "Configure Default Assistant",
+                            tint = accent,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
             }
 
             item {

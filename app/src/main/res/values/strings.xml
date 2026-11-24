@@ -10,4 +10,10 @@
     <string name="action_pause">Pause</string>
     <string name="action_resume">Resume</string>
     <string name="action_stop">Stop</string>
+    <string name="qs_tile_voice_label">Ask Aether</string>
+    <string name="screen_vision_channel_name">Aether 3D Screen Vision</string>
+    <string name="screen_vision_channel_desc">Optional screen-capture fallback when an app blocks accessibility screenshots.</string>
+    <string name="screen_vision_title">Deep Screen Vision Active</string>
+    <string name="screen_vision_subtitle">Ready to capture screen frames on your command</string>
+    <string name="action_stop_vision">Stop Vision</string>
 </resources>

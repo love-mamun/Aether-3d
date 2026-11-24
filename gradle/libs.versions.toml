@@ -43,6 +43,8 @@ googleid = "1.1.1"
 biometric = "1.1.0"
 fragmentKtx = "1.8.6"
 mlkitTextRecognition = "16.0.1"
+mlkitImageLabeling = "17.0.9"
+mlkitObjectDetection = "17.0.2"
 sqlcipher = "4.6.1"
 sqlite = "2.5.0"
 workRuntimeKtx = "2.12.0"
@@ -105,6 +107,8 @@ googleid = { group = "com.google.android.libraries.identity.googleid", name = "g
 androidx-biometric = { group = "androidx.biometric", name = "biometric", version.ref = "biometric" }
 androidx-fragment-ktx = { group = "androidx.fragment", name = "fragment-ktx", version.ref = "fragmentKtx" }
 mlkit-text-recognition = { group = "com.google.mlkit", name = "text-recognition", version.ref = "mlkitTextRecognition" }
+mlkit-image-labeling = { group = "com.google.mlkit", name = "image-labeling", version.ref = "mlkitImageLabeling" }
+mlkit-vision-objects = { group = "com.google.mlkit", name = "object-detection", version.ref = "mlkitObjectDetection" }
 sqlcipher-android = { group = "net.zetetic", name = "sqlcipher-android", version.ref = "sqlcipher" }
 androidx-sqlite-ktx = { group = "androidx.sqlite", name = "sqlite-ktx", version.ref = "sqlite" }
 androidx-work-runtime-ktx = { group = "androidx.work", name = "work-runtime-ktx", version.ref = "workRuntimeKtx" }

@@ -1,6 +1,7 @@
 package com.example.system
 
 import android.Manifest
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -25,9 +26,11 @@ data class PermissionSnapshot(
     val cameraGranted: Boolean = false,
     val coarseLocationGranted: Boolean = false,
     val contactsGranted: Boolean = false,
+    val callPhoneGranted: Boolean = false,
     val accessibilityEnabled: Boolean = false,
     val overlayGranted: Boolean = false,
     val writeSettingsGranted: Boolean = false,
+    val dndAccessGranted: Boolean = false,
     val batteryUnrestricted: Boolean = false
 ) {
     val grantedCount: Int
@@ -37,13 +40,15 @@ data class PermissionSnapshot(
             cameraGranted,
             coarseLocationGranted,
             contactsGranted,
+            callPhoneGranted,
             accessibilityEnabled,
             overlayGranted,
             writeSettingsGranted,
+            dndAccessGranted,
             batteryUnrestricted
         ).count { it }
 
-    val totalCount: Int get() = 9
+    val totalCount: Int get() = 11
 
     val allEnabled: Boolean get() = grantedCount == totalCount
 
@@ -51,22 +56,36 @@ data class PermissionSnapshot(
         PermissionItemStatus(
             id = "mic",
             title = "Microphone Voice Stream",
-            description = "Real-time voice commands & 3D audio core",
+            description = "Real-time voice commands & 'Hey Aether' wake listening",
             isGranted = micGranted,
             isSpecialSettings = false
         ),
         PermissionItemStatus(
             id = "notifications",
             title = "Agent Status Notifications",
-            description = "Background multitasking & pause controls",
+            description = "Background wake standby & pause controls",
             isGranted = notificationsGranted,
             isSpecialSettings = false
         ),
         PermissionItemStatus(
             id = "camera",
             title = "Flashlight & Camera Hardware",
-            description = "Torch control & camera command launches",
+            description = "Offline torch toggle & camera launches",
             isGranted = cameraGranted,
+            isSpecialSettings = false
+        ),
+        PermissionItemStatus(
+            id = "call_phone",
+            title = "Direct Voice Calling",
+            description = "Place calls immediately instead of stopping on keypad",
+            isGranted = callPhoneGranted,
+            isSpecialSettings = false
+        ),
+        PermissionItemStatus(
+            id = "contacts",
+            title = "Voice Contact Resolution",
+            description = "Resolve names like 'Call Ma' or 'Message Rahul'",
+            isGranted = contactsGranted,
             isSpecialSettings = false
         ),
         PermissionItemStatus(
@@ -77,37 +96,37 @@ data class PermissionSnapshot(
             isSpecialSettings = false
         ),
         PermissionItemStatus(
-            id = "contacts",
-            title = "Voice Contact Resolution",
-            description = "Resolve names like 'Call Mom' or 'Message Rahul'",
-            isGranted = contactsGranted,
-            isSpecialSettings = false
+            id = "accessibility",
+            title = "Trusted Screen-Vision Agent",
+            description = "Complete WhatsApp messages, Facebook posts & YouTube playback",
+            isGranted = accessibilityEnabled,
+            isSpecialSettings = true
         ),
         PermissionItemStatus(
             id = "overlay",
             title = "Floating 3D Orb Overlay",
-            description = "Keep a draggable voice orb & status bubble over any app",
+            description = "Keep a draggable voice orb & live status bubble over apps",
             isGranted = overlayGranted,
             isSpecialSettings = true
         ),
         PermissionItemStatus(
-            id = "accessibility",
-            title = "Trusted Screen-Vision Agent",
-            description = "See active screen, tap buttons, scroll, type & OS keys",
-            isGranted = accessibilityEnabled,
+            id = "dnd_policy",
+            title = "Do Not Disturb Control",
+            description = "Toggle DND On/Off completely offline by voice",
+            isGranted = dndAccessGranted,
             isSpecialSettings = true
         ),
         PermissionItemStatus(
             id = "write_settings",
             title = "System Brightness & Rotation",
-            description = "Adjust screen brightness and auto-rotate by voice",
+            description = "Adjust screen brightness and auto-rotate offline",
             isGranted = writeSettingsGranted,
             isSpecialSettings = true
         ),
         PermissionItemStatus(
             id = "battery",
             title = "Unrestricted Background Mode",
-            description = "Prevent OS sleep while voice agent runs in background",
+            description = "Keep 'Hey Aether' responsive while screen/apps run",
             isGranted = batteryUnrestricted,
             isSpecialSettings = true
         )
@@ -126,9 +145,12 @@ class PermissionsManager(private val context: Context) {
         val camera = hasPermission(Manifest.permission.CAMERA)
         val location = hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
         val contacts = hasPermission(Manifest.permission.READ_CONTACTS)
+        val callPhone = hasPermission(Manifest.permission.CALL_PHONE)
         val accessibility = isAccessibilityServiceEnabled()
         val overlay = Settings.canDrawOverlays(context)
         val writeSettings = Settings.System.canWrite(context)
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        val dndAccess = nm?.isNotificationPolicyAccessGranted == true
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val batteryUnrestricted = powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
 
@@ -138,11 +160,36 @@ class PermissionsManager(private val context: Context) {
             cameraGranted = camera,
             coarseLocationGranted = location,
             contactsGranted = contacts,
+            callPhoneGranted = callPhone,
             accessibilityEnabled = accessibility,
             overlayGranted = overlay,
             writeSettingsGranted = writeSettings,
+            dndAccessGranted = dndAccess,
             batteryUnrestricted = batteryUnrestricted
         )
+    }
+
+    fun isDefaultAssistantApp(): Boolean {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val rm = context.getSystemService(Context.ROLE_SERVICE) as? android.app.role.RoleManager
+            if (rm != null && rm.isRoleAvailable(android.app.role.RoleManager.ROLE_ASSISTANT)) {
+                return rm.isRoleHeld(android.app.role.RoleManager.ROLE_ASSISTANT)
+            }
+        }
+        val assistantSetting = Settings.Secure.getString(context.contentResolver, "assistant").orEmpty()
+        return assistantSetting.contains(context.packageName, ignoreCase = true)
+    }
+
+    fun buildRequestDefaultAssistantIntent(): Intent {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val rm = context.getSystemService(Context.ROLE_SERVICE) as? android.app.role.RoleManager
+            if (rm != null && rm.isRoleAvailable(android.app.role.RoleManager.ROLE_ASSISTANT) &&
+                !rm.isRoleHeld(android.app.role.RoleManager.ROLE_ASSISTANT)
+            ) {
+                return rm.createRequestRoleIntent(android.app.role.RoleManager.ROLE_ASSISTANT)
+            }
+        }
+        return Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
     }
 
     fun runtimePermissionsToRequest(): Array<String> {
@@ -150,7 +197,8 @@ class PermissionsManager(private val context: Context) {
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.CAMERA,
             Manifest.permission.ACCESS_COARSE_LOCATION,
-            Manifest.permission.READ_CONTACTS
+            Manifest.permission.READ_CONTACTS,
+            Manifest.permission.CALL_PHONE
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             list.add(Manifest.permission.POST_NOTIFICATIONS)
@@ -175,6 +223,7 @@ class PermissionsManager(private val context: Context) {
                 Uri.parse("package:${context.packageName}")
             )
             "accessibility" -> Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+            "dnd_policy" -> Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)
             "write_settings" -> Intent(
                 Settings.ACTION_MANAGE_WRITE_SETTINGS,
                 Uri.parse("package:${context.packageName}")
@@ -183,6 +232,7 @@ class PermissionsManager(private val context: Context) {
                 Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
                 Uri.parse("package:${context.packageName}")
             )
+            "assistant_role" -> Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
             else -> Intent(
                 Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                 Uri.parse("package:${context.packageName}")

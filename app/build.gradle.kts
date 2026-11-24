@@ -77,6 +77,9 @@ android {
       useLegacyPackaging = true
     }
   }
+  androidResources {
+    noCompress += listOf("bz2", "onnx", "tflite")
+  }
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
@@ -119,6 +122,8 @@ dependencies {
   implementation(libs.androidx.biometric)
   implementation(libs.androidx.fragment.ktx)
   implementation(libs.mlkit.text.recognition)
+  implementation(libs.mlkit.image.labeling)
+  implementation(libs.mlkit.vision.objects)
   implementation(files("libs/sherpa-onnx.aar"))
   implementation(libs.androidx.work.runtime.ktx)
   implementation(libs.commons.compress)

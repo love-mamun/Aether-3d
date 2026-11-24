@@ -3,6 +3,7 @@ package com.example.vision
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.util.Log
+import com.example.data.local.VisionTokenMode
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
@@ -38,10 +39,14 @@ data class ProcessedVisionContext(
     val regionLabel: String,
     val areaReductionPercent: Int,
     val ocrSummary: String,
-    val ocrLineCount: Int
+    val ocrLineCount: Int,
+    val offlineAnalysis: OfflineScreenAnalysis? = null,
+    val tokensSaved: Int = 0
 )
 
-class ScreenVisionProcessor {
+class ScreenVisionProcessor(
+    private val offlineEngine: OfflineScreenUnderstandingEngine = OfflineScreenUnderstandingEngine()
+) {
 
     /**
      * Computes a token-efficient crop region based on user prompt cues (top/bottom/center/dialog)
@@ -149,25 +154,45 @@ class ScreenVisionProcessor {
         prompt: String,
         accessibilityNodeCount: Int,
         forceOcrFallback: Boolean,
-        anchorRect: Rect? = null
+        anchorRect: Rect? = null,
+        packageName: String = "",
+        rawUiSummary: String = "",
+        visionTokenMode: VisionTokenMode = VisionTokenMode.OFFLINE_FIRST
     ): ProcessedVisionContext = withContext(Dispatchers.Default) {
         if (sourceBitmap == null) {
+            val offlineOnly = offlineEngine.analyzeBitmapAndUi(
+                bitmap = null,
+                packageName = packageName,
+                rawUiSummary = rawUiSummary,
+                nodeCount = accessibilityNodeCount,
+                ocrLines = emptyList(),
+                ocrSummary = "",
+                userPrompt = prompt,
+                visionTokenMode = visionTokenMode
+            )
             return@withContext ProcessedVisionContext(
                 croppedBitmap = null,
                 ownsCroppedBitmap = false,
                 regionLabel = "UI Tree Only",
                 areaReductionPercent = 100,
                 ocrSummary = "",
-                ocrLineCount = 0
+                ocrLineCount = 0,
+                offlineAnalysis = offlineOnly,
+                tokensSaved = offlineOnly.estimatedTokensSaved
             )
         }
 
+        val maxDim = when (visionTokenMode) {
+            VisionTokenMode.CLOUD_VISION -> 720
+            VisionTokenMode.HYBRID_COMPACT, VisionTokenMode.OFFLINE_FIRST -> 512
+        }
         val spec = computeTargetCropRect(sourceBitmap.width, sourceBitmap.height, prompt, anchorRect)
-        val cropped = runCatching { cropAndScaleRegion(sourceBitmap, spec) }.getOrNull() ?: sourceBitmap
+        val cropped = runCatching { cropAndScaleRegion(sourceBitmap, spec, maxDimension = maxDim) }.getOrNull() ?: sourceBitmap
         val ownsCropped = cropped !== sourceBitmap
 
         val shouldRunOcr = forceOcrFallback ||
-            accessibilityNodeCount < 5 ||
+            visionTokenMode == VisionTokenMode.OFFLINE_FIRST ||
+            accessibilityNodeCount < 8 ||
             wantsTextExtraction(prompt)
 
         val ocr = if (shouldRunOcr) {
@@ -181,13 +206,39 @@ class ScreenVisionProcessor {
             OcrExtractionResult(emptyList(), "")
         }
 
-        ProcessedVisionContext(
-            croppedBitmap = cropped,
-            ownsCroppedBitmap = ownsCropped,
-            regionLabel = spec.regionLabel,
-            areaReductionPercent = spec.areaReductionPercent,
+        val offlineAnalysis = offlineEngine.analyzeBitmapAndUi(
+            bitmap = cropped,
+            packageName = packageName,
+            rawUiSummary = rawUiSummary,
+            nodeCount = accessibilityNodeCount,
+            ocrLines = ocr.lines,
             ocrSummary = ocr.summaryText,
-            ocrLineCount = ocr.lines.size
+            userPrompt = prompt,
+            visionTokenMode = visionTokenMode
+        )
+
+        val bitmapForCloud: Bitmap?
+        val ownsFinalBitmap: Boolean
+        if (offlineAnalysis.shouldAttachBitmapToCloud) {
+            bitmapForCloud = cropped
+            ownsFinalBitmap = ownsCropped
+        } else {
+            if (ownsCropped) {
+                runCatching { cropped.recycle() }
+            }
+            bitmapForCloud = null
+            ownsFinalBitmap = false
+        }
+
+        ProcessedVisionContext(
+            croppedBitmap = bitmapForCloud,
+            ownsCroppedBitmap = ownsFinalBitmap,
+            regionLabel = if (bitmapForCloud == null) "Offline Vision (<50MB)" else spec.regionLabel,
+            areaReductionPercent = if (bitmapForCloud == null) 100 else spec.areaReductionPercent,
+            ocrSummary = ocr.summaryText,
+            ocrLineCount = ocr.lines.size,
+            offlineAnalysis = offlineAnalysis,
+            tokensSaved = offlineAnalysis.estimatedTokensSaved
         )
     }
 

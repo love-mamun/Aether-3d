@@ -51,7 +51,7 @@ class JarvisRenderer : GLSurfaceView.Renderer {
 
     @Volatile var targetAudioLevel = 0f
     @Volatile var targetMode = CoreMode.IDLE
-    @Volatile var targetPersona = AssistantPersona.JARVIS
+    @Volatile var targetPersona = AssistantPersona.AETHER
 
     @Volatile var userYawOffset = 0f
     @Volatile var userPitchOffset = 0f

@@ -66,27 +66,42 @@ private val NVIDIA_PRESET_MODELS = listOf(
     "meta/llama-3.1-8b-instruct"
 )
 
+private val GEMINI_PRESET_MODELS = listOf(
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash"
+)
+
 @Composable
 fun NvidiaApiDialog(
     preferences: AssistantPreferences,
     isConfigured: Boolean,
     onDismiss: () -> Unit,
-    onSave: (apiKey: String, model: String, preferPrimary: Boolean) -> Unit,
+    onSave: (
+        nvidiaKey: String,
+        nvidiaModel: String,
+        preferPrimary: Boolean,
+        geminiKey: String,
+        geminiModel: String
+    ) -> Unit,
     onFetchModels: (suspend (overrideKey: String?) -> Result<List<String>>)? = null
 ) {
     val accent = MaterialTheme.colorScheme.primary
     var apiKeyDraft by remember(preferences.nvidiaApiKey) { mutableStateOf(preferences.nvidiaApiKey) }
     var modelDraft by remember(preferences.nvidiaModel) { mutableStateOf(preferences.nvidiaModel) }
     var preferPrimaryDraft by remember(preferences.preferNvidiaPrimary) {
-        mutableStateOf(
-            preferences.preferNvidiaPrimary || !isConfigured
-        )
+        mutableStateOf(preferences.preferNvidiaPrimary)
     }
-    var showKey by remember { mutableStateOf(false) }
+    var geminiKeyDraft by remember(preferences.geminiApiKey) { mutableStateOf(preferences.geminiApiKey) }
+    var geminiModelDraft by remember(preferences.geminiModel) { mutableStateOf(preferences.geminiModel) }
+    var showNvidiaKey by remember { mutableStateOf(false) }
+    var showGeminiKey by remember { mutableStateOf(false) }
     var availableModels by remember { mutableStateOf(NVIDIA_PRESET_MODELS) }
     var loadingModels by remember { mutableStateOf(false) }
     var modelFetchStatus by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+
+    val anyConfigured = isConfigured || geminiKeyDraft.trim().length >= 16
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -101,20 +116,20 @@ fun NvidiaApiDialog(
             ) {
                 Icon(
                     imageVector = Icons.Filled.Key,
-                    contentDescription = "NVIDIA NIM API Settings",
+                    contentDescription = "AI Engine API Settings",
                     tint = accent,
                     modifier = Modifier.size(22.dp)
                 )
                 Column {
                     Text(
-                        text = "NVIDIA NIM API & KEY",
+                        text = "AI ENGINES · GEMINI & NVIDIA",
                         style = MaterialTheme.typography.titleMedium,
                         color = HudTextPrimary
                     )
                     Text(
-                        text = if (isConfigured) "Key active (in-app or Secrets)" else "Enter nvapi-... key below",
+                        text = if (anyConfigured) "Custom keys active" else "Configure Gemini & NVIDIA keys",
                         style = MaterialTheme.typography.labelSmall,
-                        color = if (isConfigured) StealthEmerald else SolarGold
+                        color = if (anyConfigured) StealthEmerald else SolarGold
                     )
                 }
             }
@@ -127,9 +142,81 @@ fun NvidiaApiDialog(
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
                 Text(
-                    text = "Endpoint: https://integrate.api.nvidia.com/v1/chat/completions",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = HudTextSecondary
+                    text = "GEMINI API (DIRECT KEY + FIREBASE FALLBACK)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = accent
+                )
+
+                OutlinedTextField(
+                    value = geminiKeyDraft,
+                    onValueChange = { geminiKeyDraft = it },
+                    label = { Text("Gemini API Key (AIza...)") },
+                    placeholder = { Text("AIzaSy...") },
+                    singleLine = true,
+                    visualTransformation = if (showGeminiKey) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        IconButton(
+                            onClick = { showGeminiKey = !showGeminiKey },
+                            modifier = Modifier.testTag("toggle_gemini_key_visibility")
+                        ) {
+                            Icon(
+                                imageVector = if (showGeminiKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                contentDescription = if (showGeminiKey) "Hide Gemini key" else "Show Gemini key",
+                                tint = HudTextSecondary
+                            )
+                        }
+                    },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = accent,
+                        unfocusedBorderColor = accent.copy(alpha = 0.35f),
+                        focusedTextColor = HudTextPrimary,
+                        unfocusedTextColor = HudTextPrimary
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("gemini_key_field")
+                )
+
+                OutlinedTextField(
+                    value = geminiModelDraft,
+                    onValueChange = { geminiModelDraft = it },
+                    label = { Text("Gemini Model ID") },
+                    singleLine = true,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = accent,
+                        unfocusedBorderColor = accent.copy(alpha = 0.35f),
+                        focusedTextColor = HudTextPrimary,
+                        unfocusedTextColor = HudTextPrimary
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("gemini_model_field")
+                )
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    GEMINI_PRESET_MODELS.forEach { preset ->
+                        FilterChip(
+                            selected = geminiModelDraft.trim() == preset,
+                            onClick = { geminiModelDraft = preset },
+                            label = { Text(preset, style = MaterialTheme.typography.labelSmall) },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = accent.copy(alpha = 0.22f),
+                                selectedLabelColor = accent
+                            )
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = "NVIDIA NIM API",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = accent
                 )
 
                 OutlinedTextField(
@@ -138,15 +225,15 @@ fun NvidiaApiDialog(
                     label = { Text("NVIDIA API Key (nvapi-...)") },
                     placeholder = { Text("nvapi-xxxxxxxxxxxxxxxx") },
                     singleLine = true,
-                    visualTransformation = if (showKey) VisualTransformation.None else PasswordVisualTransformation(),
+                    visualTransformation = if (showNvidiaKey) VisualTransformation.None else PasswordVisualTransformation(),
                     trailingIcon = {
                         IconButton(
-                            onClick = { showKey = !showKey },
+                            onClick = { showNvidiaKey = !showNvidiaKey },
                             modifier = Modifier.testTag("toggle_nvidia_key_visibility")
                         ) {
                             Icon(
-                                imageVector = if (showKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                contentDescription = if (showKey) "Hide API key" else "Show API key",
+                                imageVector = if (showNvidiaKey) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
+                                contentDescription = if (showNvidiaKey) "Hide API key" else "Show API key",
                                 tint = HudTextSecondary
                             )
                         }
@@ -267,12 +354,12 @@ fun NvidiaApiDialog(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Use NVIDIA API Directly",
+                                text = "Use NVIDIA API as Main (Gemini Fallback)",
                                 style = MaterialTheme.typography.titleSmall,
                                 color = HudTextPrimary
                             )
                             Text(
-                                text = "Skip Gemini and route all commands directly through NVIDIA NIM",
+                                text = "Route commands through NVIDIA NIM first and fall back to Gemini automatically",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = HudTextSecondary
                             )
@@ -286,12 +373,13 @@ fun NvidiaApiDialog(
                     }
                 }
 
-                if (apiKeyDraft.isNotBlank()) {
+                if (apiKeyDraft.isNotBlank() || geminiKeyDraft.isNotBlank()) {
                     OutlinedButton(
                         onClick = {
                             apiKeyDraft = ""
+                            geminiKeyDraft = ""
                             preferPrimaryDraft = false
-                            onSave("", modelDraft, false)
+                            onSave("", modelDraft.trim(), false, "", geminiModelDraft.trim())
                             onDismiss()
                         },
                         border = BorderStroke(1.dp, AlertCoral.copy(alpha = 0.65f)),
@@ -299,7 +387,7 @@ fun NvidiaApiDialog(
                             .fillMaxWidth()
                             .testTag("nvidia_clear_button")
                     ) {
-                        Text("Clear Saved In-App Key", color = AlertCoral)
+                        Text("Clear Saved API Keys", color = AlertCoral)
                     }
                 }
             }
@@ -307,9 +395,16 @@ fun NvidiaApiDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    val trimmedKey = apiKeyDraft.trim()
-                    val usePrimary = preferPrimaryDraft && (trimmedKey.isNotEmpty() || isConfigured)
-                    onSave(trimmedKey, modelDraft.trim(), usePrimary)
+                    val trimmedNvidia = apiKeyDraft.trim()
+                    val trimmedGemini = geminiKeyDraft.trim()
+                    val usePrimary = preferPrimaryDraft && (trimmedNvidia.isNotEmpty() || isConfigured)
+                    onSave(
+                        trimmedNvidia,
+                        modelDraft.trim(),
+                        usePrimary,
+                        trimmedGemini,
+                        geminiModelDraft.trim()
+                    )
                     onDismiss()
                 },
                 colors = ButtonDefaults.buttonColors(

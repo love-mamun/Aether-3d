@@ -13,6 +13,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ai.configureAppCheck
 import com.example.briefing.BriefingWorker
+import com.example.service.AetherVoiceTileService
 import com.example.ui.AetherCockpitScreen
 import com.example.ui.theme.Aether3DTheme
 import com.example.ui.viewmodel.JarvisViewModel
@@ -37,11 +38,20 @@ class MainActivity : FragmentActivity() {
                 val incoming = pendingLaunchIntent ?: return@LaunchedEffect
                 val triggerBriefing = incoming.getBooleanExtra(BriefingWorker.EXTRA_TRIGGER_BRIEFING, false)
                 val reminderTitle = incoming.getStringExtra(BriefingWorker.EXTRA_REMINDER_TITLE).orEmpty()
+                val triggerVoice = incoming.action == Intent.ACTION_ASSIST ||
+                    incoming.action == AetherVoiceTileService.ACTION_TRIGGER_AETHER_VOICE ||
+                    incoming.getBooleanExtra(AetherVoiceTileService.EXTRA_START_VOICE_IMMEDIATELY, false)
+
                 if (triggerBriefing || reminderTitle.isNotBlank()) {
                     incoming.removeExtra(BriefingWorker.EXTRA_TRIGGER_BRIEFING)
                     incoming.removeExtra(BriefingWorker.EXTRA_REMINDER_TITLE)
                     pendingLaunchIntent = null
                     jarvisViewModel.runDailyBriefing(reminderTitle)
+                } else if (triggerVoice) {
+                    incoming.removeExtra(AetherVoiceTileService.EXTRA_START_VOICE_IMMEDIATELY)
+                    incoming.action = Intent.ACTION_MAIN
+                    pendingLaunchIntent = null
+                    jarvisViewModel.startVoiceFromExternalTrigger()
                 }
             }
 

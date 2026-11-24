@@ -26,17 +26,11 @@ object BriefingScheduler {
             return
         }
 
-        val now = Calendar.getInstance()
-        val next = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, hour.coerceIn(0, 23))
-            set(Calendar.MINUTE, minute.coerceIn(0, 59))
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-            if (timeInMillis <= now.timeInMillis) {
-                add(Calendar.DAY_OF_YEAR, 1)
-            }
-        }
-        val initialDelayMs = (next.timeInMillis - now.timeInMillis).coerceAtLeast(1_000L)
+        val initialDelayMs = computeDailyBriefingInitialDelayMs(
+            nowMillis = System.currentTimeMillis(),
+            hour = hour,
+            minute = minute
+        )
 
         val request = PeriodicWorkRequestBuilder<BriefingWorker>(24, TimeUnit.HOURS)
             .setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
@@ -61,7 +55,7 @@ object BriefingScheduler {
         triggerAtMillis: Long
     ) {
         val wm = WorkManager.getInstance(context.applicationContext)
-        val delayMs = (triggerAtMillis - System.currentTimeMillis()).coerceAtLeast(1_000L)
+        val delayMs = computeReminderDelayMs(triggerAtMillis = triggerAtMillis, nowMillis = System.currentTimeMillis())
         val request = OneTimeWorkRequestBuilder<BriefingWorker>()
             .setInitialDelay(delayMs, TimeUnit.MILLISECONDS)
             .setInputData(
@@ -83,5 +77,29 @@ object BriefingScheduler {
     fun cancelReminder(context: Context, reminderId: Long) {
         WorkManager.getInstance(context.applicationContext)
             .cancelUniqueWork("aether_reminder_$reminderId")
+    }
+
+    internal fun computeDailyBriefingInitialDelayMs(
+        nowMillis: Long,
+        hour: Int,
+        minute: Int,
+        timeZone: java.util.TimeZone = java.util.TimeZone.getDefault()
+    ): Long {
+        val now = Calendar.getInstance(timeZone).apply { timeInMillis = nowMillis }
+        val next = Calendar.getInstance(timeZone).apply {
+            timeInMillis = nowMillis
+            set(Calendar.HOUR_OF_DAY, hour.coerceIn(0, 23))
+            set(Calendar.MINUTE, minute.coerceIn(0, 59))
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            if (timeInMillis <= now.timeInMillis) {
+                add(Calendar.DAY_OF_YEAR, 1)
+            }
+        }
+        return (next.timeInMillis - now.timeInMillis).coerceAtLeast(1_000L)
+    }
+
+    internal fun computeReminderDelayMs(triggerAtMillis: Long, nowMillis: Long): Long {
+        return (triggerAtMillis - nowMillis).coerceAtLeast(1_000L)
     }
 }

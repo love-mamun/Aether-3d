@@ -15,6 +15,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
@@ -65,10 +66,8 @@ fun HumanCartoonAvatar(
         CoreMode.THINKING, CoreMode.OBSERVING_SCREEN -> Color(0xFFFFB300)
         CoreMode.MULTITASKING -> Color(0xFF00E676)
         else -> when (persona) {
-            AssistantPersona.JARVIS -> Color(0xFF00E5FF)
-            AssistantPersona.MAX -> Color(0xFFFFB300)
-            AssistantPersona.MAYRA -> Color(0xFFB388FF)
-            AssistantPersona.STEALTH -> Color(0xFF00E676)
+            AssistantPersona.AETHER -> Color(0xFF00E5FF)
+            AssistantPersona.ARIA -> Color(0xFFB388FF)
         }
     }
 
@@ -88,21 +87,25 @@ fun HumanCartoonAvatar(
     val clampedPitch = headPitchDeg.coerceIn(-18f, 18f)
     val scaleFactor = (1f / zoomScale.coerceIn(0.65f, 1.65f)).coerceIn(0.78f, 1.32f)
 
-    Box(
+    BoxWithConstraints(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .fillMaxSize()
             .testTag("human_cartoon_avatar")
     ) {
+        val outerSize = (minOf(maxWidth, maxHeight) * 0.56f).coerceIn(160.dp, 248.dp)
+        val portraitSize = outerSize * 0.83f
+        val yLift = (maxHeight * 0.05f).coerceIn(12.dp, 42.dp)
+
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
-                .size(258.dp)
+                .size(outerSize)
                 .graphicsLayer {
                     cameraDistance = 16f * density
                     rotationY = clampedYaw
                     rotationX = -clampedPitch
-                    translationY = breathY - 48.dp.toPx()
+                    translationY = breathY - yLift.toPx()
                     scaleX = scaleFactor
                     scaleY = scaleFactor
                 }
@@ -117,7 +120,7 @@ fun HumanCartoonAvatar(
             // Crisp photorealistic portrait medallion
             Box(
                 modifier = Modifier
-                    .size(214.dp)
+                    .size(portraitSize)
                     .clip(CircleShape)
                     .background(Color(0xFF070C18))
                     .border(
@@ -251,8 +254,6 @@ private fun MiniVoiceBars(
 
 @DrawableRes
 fun avatarDrawableFor(persona: AssistantPersona): Int = when (persona) {
-    AssistantPersona.JARVIS -> R.drawable.img_avatar_jarvis
-    AssistantPersona.MAX -> R.drawable.img_avatar_max
-    AssistantPersona.MAYRA -> R.drawable.img_avatar_mayra
-    AssistantPersona.STEALTH -> R.drawable.img_avatar_stealth
+    AssistantPersona.AETHER -> R.drawable.img_avatar_jarvis
+    AssistantPersona.ARIA -> R.drawable.img_avatar_mayra
 }

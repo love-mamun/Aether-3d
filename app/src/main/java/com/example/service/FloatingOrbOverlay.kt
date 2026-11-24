@@ -34,6 +34,7 @@ class FloatingOrbOverlay(
     private val onVisionScanTapped: () -> Unit,
     private val onMacroRecordTapped: () -> Unit,
     private val onBriefingTapped: () -> Unit,
+    private val onAbortTask: () -> Unit,
     private val onStopOverlay: () -> Unit
 ) {
     private val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -44,6 +45,7 @@ class FloatingOrbOverlay(
     private var bubbleLayout: LinearLayout? = null
     private var actionDrawer: LinearLayout? = null
     private var macroPill: TextView? = null
+    private var abortBtnView: TextView? = null
     private var recBadgeView: TextView? = null
     private var statusTextView: TextView? = null
     private var layoutParams: WindowManager.LayoutParams? = null
@@ -122,11 +124,18 @@ class FloatingOrbOverlay(
             text = "Aether Ready · 2x tap menu"
         }
 
+        val touchPadH = (10f * density).toInt()
+        val minTapPx = (48f * density).toInt()
+
         val menuToggleBtn = TextView(context).apply {
             setTextColor(0xFF00E5FF.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            text = "  ☰"
-            setPadding((6f * density).toInt(), 0, (4f * density).toInt(), 0)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            text = "☰"
+            gravity = Gravity.CENTER
+            minWidth = minTapPx
+            minHeight = minTapPx
+            setPadding(touchPadH, 0, touchPadH, 0)
+            contentDescription = "Toggle quick actions menu"
             setOnClickListener {
                 drawerExpanded = !drawerExpanded
                 actionDrawer?.visibility = if (drawerExpanded) View.VISIBLE else View.GONE
@@ -134,11 +143,28 @@ class FloatingOrbOverlay(
             }
         }
 
+        val abortBtn = TextView(context).apply {
+            setTextColor(0xFFFF6E6E.toInt())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
+            text = "ABORT"
+            gravity = Gravity.CENTER
+            minWidth = minTapPx
+            minHeight = minTapPx
+            setPadding(touchPadH, 0, touchPadH, 0)
+            visibility = View.GONE
+            contentDescription = "Abort active tasks"
+            setOnClickListener { onAbortTask() }
+        }
+
         val closeBtn = TextView(context).apply {
             setTextColor(0xFF9FB3C8.toInt())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            text = "  ×"
-            setPadding((6f * density).toInt(), 0, (4f * density).toInt(), 0)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            text = "×"
+            gravity = Gravity.CENTER
+            minWidth = minTapPx
+            minHeight = minTapPx
+            setPadding(touchPadH, 0, touchPadH, 0)
+            contentDescription = "Hide floating orb"
             setOnClickListener { onStopOverlay() }
         }
 
@@ -154,6 +180,7 @@ class FloatingOrbOverlay(
             )
             visibility = View.GONE
             addView(statusTv)
+            addView(abortBtn)
             addView(menuToggleBtn)
             addView(closeBtn)
             setOnClickListener {
@@ -311,6 +338,7 @@ class FloatingOrbOverlay(
             bubbleLayout = bubble
             actionDrawer = drawer
             macroPill = recMacroPill
+            abortBtnView = abortBtn
             recBadgeView = recBadge
             statusTextView = statusTv
             layoutParams = params
@@ -324,12 +352,25 @@ class FloatingOrbOverlay(
         message: String,
         showBubble: Boolean,
         isMacroRecording: Boolean = false,
-        macroStepCount: Int = 0
+        macroStepCount: Int = 0,
+        visionSource: String = "",
+        isWaitingForLoad: Boolean = false
     ) {
         if (!isShowing) return
         mainHandler.post {
             orbView?.setVisualState(coreMode, persona, isMacroRecording)
-            statusTextView?.text = message
+            val displayMessage = when {
+                isWaitingForLoad -> "⏳ Waiting for screen to load… ${message.take(45)}"
+                visionSource.isNotBlank() &&
+                    (coreMode == CoreMode.OBSERVING_SCREEN || coreMode == CoreMode.MULTITASKING) ->
+                    "[$visionSource] $message"
+                else -> message
+            }
+            statusTextView?.text = displayMessage
+            val isRunningTask = coreMode == CoreMode.MULTITASKING ||
+                coreMode == CoreMode.OBSERVING_SCREEN ||
+                coreMode == CoreMode.THINKING
+            abortBtnView?.visibility = if (isRunningTask) View.VISIBLE else View.GONE
             bubbleLayout?.visibility = if (showBubble || coreMode != CoreMode.IDLE || drawerExpanded) {
                 View.VISIBLE
             } else {
@@ -355,6 +396,7 @@ class FloatingOrbOverlay(
             bubbleLayout = null
             actionDrawer = null
             macroPill = null
+            abortBtnView = null
             recBadgeView = null
             statusTextView = null
             layoutParams = null
@@ -371,7 +413,7 @@ class FloatingOrbOverlay(
         private val portraitPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
 
         private var accentColor: Int = 0xFF00E5FF.toInt()
-        private var currentPersona: AssistantPersona = AssistantPersona.JARVIS
+        private var currentPersona: AssistantPersona = AssistantPersona.AETHER
         private var cachedBitmapPersona: AssistantPersona? = null
         private var cachedShaderRadius = 0f
         private var animating = false
@@ -394,10 +436,8 @@ class FloatingOrbOverlay(
                 mode == CoreMode.THINKING || mode == CoreMode.OBSERVING_SCREEN -> 0xFFFFB300.toInt()
                 mode == CoreMode.MULTITASKING -> 0xFF00E676.toInt()
                 else -> when (persona) {
-                    AssistantPersona.JARVIS -> 0xFF00E5FF.toInt()
-                    AssistantPersona.MAX -> 0xFFFFB300.toInt()
-                    AssistantPersona.MAYRA -> 0xFFB388FF.toInt()
-                    AssistantPersona.STEALTH -> 0xFF00E676.toInt()
+                    AssistantPersona.AETHER -> 0xFF00E5FF.toInt()
+                    AssistantPersona.ARIA -> 0xFFB388FF.toInt()
                 }
             }
             val shouldAnimate = mode != CoreMode.IDLE || isMacroRecording

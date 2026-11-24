@@ -11,14 +11,30 @@ import com.google.firebase.ai.type.generationConfig
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
-import org.json.JSONArray
-import org.json.JSONObject
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.longOrNull
 
 private const val TAG = "GeminiCommandService"
 
 class GeminiCommandService(
-    private val nvidiaFallback: NvidiaFallbackService = NvidiaFallbackService()
+    private val nvidiaFallback: NvidiaFallbackService = NvidiaFallbackService(),
+    private val geminiApiKeyProvider: (() -> String)? = null,
+    private val geminiModelProvider: (() -> String)? = null
 ) {
+
+    private val directGeminiClient = DirectGeminiRestClient(
+        apiKeyProvider = { geminiApiKeyProvider?.invoke().orEmpty() },
+        modelProvider = { geminiModelProvider?.invoke().orEmpty() }
+    )
 
     @Volatile
     private var geminiBillingUnavailable = false
@@ -43,6 +59,9 @@ class GeminiCommandService(
             ),
             "textPayload" to Schema.string(
                 description = "Message body, alarm label, email body/subject, memory text, routine prompt, currency target code, or text to type into an active UI field"
+            ),
+            "recipient" to Schema.string(
+                description = "Exact contact name or handle for SEND_APP_MESSAGE / SEND_MESSAGE (e.g. 'Ma', 'Mom', 'Rahul')"
             ),
             "intValue" to Schema.integer(
                 description = "Hour (0-23) for alarm, duration seconds for timer, volume/brightness percent (0-100), or normalized X coordinate (0-1000) for UI_TAP_COORDINATES"
@@ -69,6 +88,7 @@ class GeminiCommandService(
             "timeoutMs",
             "target",
             "textPayload",
+            "recipient",
             "intValue",
             "secondaryIntValue",
             "doubleValue",
@@ -80,21 +100,28 @@ class GeminiCommandService(
 
     private val planSchema = Schema.obj(
         properties = mapOf(
+            "transcript" to Schema.string(
+                description = "Exact transcription of the user's spoken audio command when audio input is provided"
+            ),
             "reply" to Schema.string(
-                description = "Natural, concise spoken reply matching the active persona in English or Bangla (বাংলা) as used by the user"
+                description = "Natural, concise spoken answer directly answering the user's question or confirming their requested action in English or Bangla. NEVER read aloud or describe screen UI elements, OCR text, or visible screen layout unless the user explicitly asked what is on their screen."
             ),
             "needsScreenObservation" to Schema.boolean(
-                description = "Set true only if the request explicitly requires inspecting or interacting with the user's current screen and no screen snapshot was provided yet"
+                description = "Set true ONLY if performing the requested UI action requires observing/clicking the current screen and no screen snapshot is attached yet. Keep false for normal Q&A, chat, knowledge, or direct commands."
             ),
             "continueLoopAfterAction" to Schema.boolean(
-                description = "Set true if executing the UI step opens a new screen that requires one more observe-act step to finish the user's multi-step goal"
+                description = "Set true if executing the UI step opens a new screen that requires another observe-act ReAct step to finish the user's multi-step goal"
+            ),
+            "subGoals" to Schema.array(
+                items = Schema.string(description = "Ordered short milestone label (e.g. 'Open YouTube', 'Search channel', 'Open Videos tab', 'Play first video')"),
+                description = "Ordered sub-goal checklist whenever the command requires 2+ sequential UI navigation hops inside an app"
             ),
             "steps" to Schema.array(
                 items = stepSchema,
                 description = "Ordered DAG of 1 to 6 executable actions. Use SPEAK_ONLY when purely answering a question."
             )
         ),
-        optionalProperties = listOf("needsScreenObservation", "continueLoopAfterAction")
+        optionalProperties = listOf("transcript", "needsScreenObservation", "continueLoopAfterAction", "subGoals")
     )
 
     private val plannerModel by lazy {
@@ -135,6 +162,43 @@ class GeminiCommandService(
         )
     }
 
+    suspend fun planAudioCommand(
+        wavAudioBytes: ByteArray,
+        persona: AssistantPersona,
+        deviceContextSummary: String,
+        memoriesSummary: String,
+        routinesSummary: String,
+        contactsSummary: String,
+        installedAppsSummary: String,
+        conversationHistorySummary: String = "",
+        conversationTurns: List<Pair<String, String>> = emptyList(),
+        screenUiSummary: String? = null,
+        screenBitmap: Bitmap? = null,
+        ocrSummary: String? = null,
+        preferNvidiaPrimary: Boolean = false,
+        onStreamingReply: ((String) -> Unit)? = null,
+        onActiveModelChanged: ((String) -> Unit)? = null
+    ): Result<CommandPlan> {
+        return planCommandInternal(
+            userPrompt = "Listen carefully to the attached filtered microphone audio (16 kHz mono WAV). Ignore any faint residual background noise, transcribe the human speaker's command into the 'transcript' field, and produce the CommandPlan JSON.",
+            persona = persona,
+            deviceContextSummary = deviceContextSummary,
+            memoriesSummary = memoriesSummary,
+            routinesSummary = routinesSummary,
+            contactsSummary = contactsSummary,
+            installedAppsSummary = installedAppsSummary,
+            conversationHistorySummary = conversationHistorySummary,
+            conversationTurns = conversationTurns,
+            screenUiSummary = screenUiSummary,
+            screenBitmap = screenBitmap,
+            ocrSummary = ocrSummary,
+            audioWavBytes = wavAudioBytes,
+            preferNvidiaPrimary = preferNvidiaPrimary,
+            onStreamingReply = onStreamingReply,
+            onActiveModelChanged = onActiveModelChanged
+        )
+    }
+
     suspend fun planCommand(
         userPrompt: String,
         persona: AssistantPersona,
@@ -146,58 +210,126 @@ class GeminiCommandService(
         screenUiSummary: String?,
         screenBitmap: Bitmap?,
         ocrSummary: String? = null,
-        preferNvidiaPrimary: Boolean = false,
+        conversationHistorySummary: String = "",
+        conversationTurns: List<Pair<String, String>> = emptyList(),
+        preferNvidiaPrimary: Boolean = true,
+        compactLoopMode: Boolean = false,
         onStreamingReply: ((String) -> Unit)? = null,
         onActiveModelChanged: ((String) -> Unit)? = null
     ): Result<CommandPlan> {
-        val fullInstruction = buildString {
-            appendLine(persona.stylePrompt)
-            appendLine("You are Aether 3D, a multitasking Android OS agent supporting Bangla (বাংলা) and English ONLY. Convert the user's voice/text request into a structured CommandPlan JSON.")
-            appendLine("Rules:")
-            appendLine("1. Support multitasking & Task DAG dependencies: assign short stepId ('s0', 's1'...) and populate dependsOn when one step relies on another (e.g. UI tap/input after LAUNCH_APP), while keeping independent tools (WEATHER_LOOKUP, WIKIPEDIA_LOOKUP, CURRENCY_CONVERT, SAVE_MEMORY, CREATE_ROUTINE, TOGGLE_TORCH, ADJUST_VOLUME, SET_BRIGHTNESS, SET_AUTO_ROTATE, SET_ALARM, SET_TIMER) parallel with isBackgroundParallel=true and empty dependsOn.")
-            appendLine("2. CRITICAL FOR APP SEARCH ('open YouTube and search X', 'search X in Spotify/Maps/Play Store/Chrome'): emit SEARCH_IN_APP with target=app name (e.g. 'YouTube') and textPayload=exact query (e.g. 'Nova king entertainment') — DO NOT emit bare LAUNCH_APP alone when a search query is included! Only use bare LAUNCH_APP when no in-app search/action is requested.")
-            appendLine("3. For screen questions ('what is on my screen', 'summarize this', 'tap X', 'scroll down', 'type Y'), use ACTIVE SCREEN UI TREE, ON-DEVICE OCR FALLBACK, or the attached image to answer directly or emit UI_TAP_TEXT, UI_TAP_COORDINATES (0-1000 scale), UI_INPUT_TEXT, UI_SCROLL, or GLOBAL_ACTION. If neither UI tree, OCR, nor image is attached yet and the command needs the screen, set needsScreenObservation=true.")
-            appendLine("4. For calls/SMS/WhatsApp/Email, set target=contact name or phone/email, textPayload=message body, and isSensitive=true.")
-            appendLine("5. For weather queries, emit WEATHER_LOOKUP with target=city name (or 'current' for local weather).")
-            appendLine("6. For factual/encyclopedia queries needing live verification, emit WIKIPEDIA_LOOKUP with target=topic.")
-            appendLine("7. For currency conversion, emit CURRENCY_CONVERT with target='FROM->TO' (e.g. 'USD->BDT' or 'USD->INR') and doubleValue=amount.")
-            appendLine("8. For 'remember ...', emit SAVE_MEMORY with textPayload=fact to save.")
-            appendLine("9. Match language cleanly: reply in Bangla if user wrote/spoke Bangla (or Banglish), otherwise English. If no device action is needed, emit a single SPEAK_ONLY step.")
-            appendLine()
-            appendLine("LIVE DEVICE TELEMETRY:")
-            appendLine(deviceContextSummary)
-            if (memoriesSummary.isNotBlank()) {
-                appendLine("\nLOCAL SQLITE MEMORIES:\n$memoriesSummary")
+        return planCommandInternal(
+            userPrompt = userPrompt,
+            persona = persona,
+            deviceContextSummary = deviceContextSummary,
+            memoriesSummary = memoriesSummary,
+            routinesSummary = routinesSummary,
+            contactsSummary = contactsSummary,
+            installedAppsSummary = installedAppsSummary,
+            conversationHistorySummary = conversationHistorySummary,
+            conversationTurns = conversationTurns,
+            screenUiSummary = screenUiSummary,
+            screenBitmap = screenBitmap,
+            ocrSummary = ocrSummary,
+            audioWavBytes = null,
+            preferNvidiaPrimary = preferNvidiaPrimary,
+            compactLoopMode = compactLoopMode,
+            onStreamingReply = onStreamingReply,
+            onActiveModelChanged = onActiveModelChanged
+        )
+    }
+
+    private suspend fun planCommandInternal(
+        userPrompt: String,
+        persona: AssistantPersona,
+        deviceContextSummary: String,
+        memoriesSummary: String,
+        routinesSummary: String,
+        contactsSummary: String,
+        installedAppsSummary: String,
+        conversationHistorySummary: String,
+        conversationTurns: List<Pair<String, String>>,
+        screenUiSummary: String?,
+        screenBitmap: Bitmap?,
+        ocrSummary: String?,
+        audioWavBytes: ByteArray?,
+        preferNvidiaPrimary: Boolean,
+        compactLoopMode: Boolean = false,
+        onStreamingReply: ((String) -> Unit)?,
+        onActiveModelChanged: ((String) -> Unit)?
+    ): Result<CommandPlan> {
+        val fullInstruction = if (compactLoopMode) {
+            buildString {
+                appendLine("Aether 3D Screen Navigation Step. Output strictly JSON CommandPlan.")
+                appendLine("Pick ONE concrete UI action (UI_TAP_COORDINATES, UI_TAP_TEXT, UI_INPUT_TEXT, UI_SCROLL, or GLOBAL_ACTION) to complete [CURRENT]. Set continueLoopAfterAction=true if more sub-goals remain, else SPEAK_ONLY with continueLoopAfterAction=false once final goal is visibly complete.")
+                if (!screenUiSummary.isNullOrBlank()) {
+                    appendLine("\nSCREEN CONTEXT:\n$screenUiSummary")
+                }
+                if (!ocrSummary.isNullOrBlank()) {
+                    appendLine("\n$ocrSummary")
+                }
+                appendLine("\nSTEP GOAL: $userPrompt")
             }
-            if (routinesSummary.isNotBlank()) {
-                appendLine("\nSAVED VOICE ROUTINES:\n$routinesSummary")
+        } else {
+            buildString {
+                appendLine(persona.stylePrompt)
+                appendLine("You are Aether 3D, a multitasking Android OS agent supporting Bangla (বাংলা), Banglish, and English. Convert the user's request into a structured CommandPlan JSON.")
+                appendLine("Rules:")
+                appendLine("1. Support multitasking & Task DAG dependencies: assign short stepId ('s0', 's1'...) and populate dependsOn when a step relies on an earlier step, while keeping independent tools (WEATHER_LOOKUP, WIKIPEDIA_LOOKUP, CURRENCY_CONVERT, SAVE_MEMORY, CREATE_ROUTINE, TOGGLE_TORCH, TOGGLE_DND, ADJUST_VOLUME, SET_BRIGHTNESS, SET_ALARM, SET_TIMER) parallel with isBackgroundParallel=true.")
+                appendLine("2. CRITICAL FOR FACEBOOK / SOCIAL MEDIA POSTS ('Facebook khule akta post koro I am happy today', 'post ... on Facebook/Instagram'): emit POST_SOCIAL with target='Facebook' (or app name), textPayload=exact post text (e.g. 'I am happy today'), isSensitive=false, continueLoopAfterAction=false! Our autonomous social UI driver will open Facebook, tap the composer box, type the post, and tap Post.")
+                appendLine("3. CRITICAL FOR IN-APP MESSAGING ('WhatsApp a ma ke message koro ...', 'send message to Mom on WhatsApp/Telegram/Messenger'): emit SEND_APP_MESSAGE with target=app name ('WhatsApp'), recipient=contact name ('Ma'), textPayload=exact message body, isSensitive=false, continueLoopAfterAction=false!")
+                appendLine("4. YOUTUBE PLAYBACK vs MULTI-HOP NAVIGATION: For a simple single song/video request ('play song X on YouTube', 'YouTube a X gan chalao'), use PLAY_MEDIA with target='YouTube', textPayload=query. HOWEVER, if the user asks for multiple UI hops (e.g. 'YouTube a novaking entertainment search kore channel a giye first video play koro', visiting a channel/profile, switching to Videos/Shorts tab, sorting, commenting, etc.), DO NOT use PLAY_MEDIA shortcut — emit LAUNCH_APP with target='YouTube', continueLoopAfterAction=true, and populate 'subGoals' in order (e.g. ['Open YouTube', 'Search novaking entertainment', 'Open channel', 'Open Videos section', 'Play first video']).")
+                appendLine("5. HARDWARE TOGGLES: Use TOGGLE_TORCH (boolValue), TOGGLE_DND (boolValue), TOGGLE_WIFI (boolValue), TOGGLE_BLUETOOTH (boolValue), ADJUST_VOLUME (target='up'/'down'/'mute'/'set', intValue=percent), CONTROL_MEDIA (target='play'/'pause'/'next'/'previous').")
+                appendLine("6. DIRECT PHONE CALLS ('call Ma', 'dial 017...', 'মা কে কল করো'): emit DIAL_CONTACT with target=contact name/number and isSensitive=false so calling runs directly.")
+                appendLine("7. SILENT BACKGROUND SCREEN OBSERVATION: Whenever ACTIVE SCREEN UI TREE, OCR, or a screenshot is attached, use it SILENTLY in the background solely to choose tap/input/scroll targets (UI_TAP_TEXT, UI_TAP_COORDINATES, UI_INPUT_TEXT, UI_SCROLL). In 'reply', NEVER describe, summarize, or read aloud what is on the user's screen unless the user explicitly asked you to look at or explain the screen (e.g., 'what is on my screen', 'read this screen', 'screen e ki ache'). If no snapshot is attached yet and screen clicking is required, set needsScreenObservation=true.")
+                appendLine("8. MEMORY CONTINUITY: Use RECENT CONVERSATION HISTORY and LOCAL SQLITE MEMORIES to resolve follow-ups ('him', 'her', 'that', 'amar ager kotha', 'amar nam ki', previous topic). Whenever the user shares any new personal fact ('my name is...', 'remember...', 'amar basa...'), ALSO emit a background SAVE_MEMORY step alongside SPEAK_ONLY.")
+                appendLine("9. LIVE TOOLS & WEATHER/RAIN: Whenever the user asks about weather, temperature, or rain WITHOUT naming a city ('ajke ki bristi hobe?', 'will it rain today?', 'weather kemon?', 'ajker abohawa?'), NEVER ask the user for a city name — ALWAYS emit WEATHER_LOOKUP with target='current' and isBackgroundParallel=true (device GPS/Network/IP resolves location automatically). Also use WIKIPEDIA_LOOKUP (target=topic), CURRENCY_CONVERT (target='FROM->TO', doubleValue=amount).")
+                appendLine("10. ANSWER ONLY WHAT THE USER ASKED: Reply in natural English or Bangla as used by the user. Answer their exact question or concisely confirm the action — do NOT narrate background screen observations or device telemetry unless asked. If no device action is needed, emit a single SPEAK_ONLY step.")
+                appendLine("11. UNIFIED MULTI-STEP APP WORKFLOWS: Whenever any command requires multi-step screen navigation across YouTube, WhatsApp, Facebook, Chrome, Instagram, or Settings (beyond a simple send or post), emit an initial LAUNCH_APP step with continueLoopAfterAction=true and a clear 3-to-6 item 'subGoals' list so our Observe-Think-Act ReAct engine waits for screen loads and navigates each hop automatically.")
+                appendLine()
+                if (memoriesSummary.isNotBlank()) {
+                    appendLine("LOCAL SQLITE MEMORIES (LONG-TERM USER FACTS — ALWAYS RECALL THESE):\n$memoriesSummary\n")
+                }
+                if (conversationHistorySummary.isNotBlank()) {
+                    appendLine("RECENT CONVERSATION HISTORY (OLDEST TO NEWEST — USE FOR FOLLOW-UPS):\n$conversationHistorySummary\n")
+                }
+                appendLine("LIVE DEVICE TELEMETRY:")
+                appendLine(deviceContextSummary)
+                if (routinesSummary.isNotBlank()) {
+                    appendLine("\nSAVED VOICE ROUTINES:\n$routinesSummary")
+                }
+                if (contactsSummary.isNotBlank()) {
+                    appendLine("\nQUICK CONTACTS:\n$contactsSummary")
+                }
+                if (installedAppsSummary.isNotBlank()) {
+                    appendLine("\nINSTALLED APPS:\n$installedAppsSummary")
+                }
+                if (!screenUiSummary.isNullOrBlank()) {
+                    appendLine("\nACTIVE SCREEN UI TREE:\n$screenUiSummary")
+                }
+                if (!ocrSummary.isNullOrBlank()) {
+                    appendLine("\n$ocrSummary")
+                }
+                appendLine("\nUSER COMMAND: $userPrompt")
             }
-            if (contactsSummary.isNotBlank()) {
-                appendLine("\nQUICK CONTACTS:\n$contactsSummary")
-            }
-            if (installedAppsSummary.isNotBlank()) {
-                appendLine("\nINSTALLED APPS SAMPLE:\n$installedAppsSummary")
-            }
-            if (!screenUiSummary.isNullOrBlank()) {
-                appendLine("\nACTIVE SCREEN UI TREE:\n$screenUiSummary")
-            }
-            if (!ocrSummary.isNullOrBlank()) {
-                appendLine("\n$ocrSummary")
-            }
-            appendLine("\nUSER COMMAND: $userPrompt")
         }
 
         suspend fun invokeModelStreaming(
             tierKey: String,
             model: GenerativeModel,
-            promptText: String
+            promptText: String,
+            timeoutMs: Long
         ): String {
             val sb = StringBuilder()
-            withTimeout(45_000L) {
-                val flow = if (screenBitmap != null) {
+            withTimeout(timeoutMs) {
+                val flow = if (screenBitmap != null || audioWavBytes != null) {
                     model.generateContentStream(
                         content {
-                            image(screenBitmap)
+                            if (audioWavBytes != null) {
+                                inlineData(audioWavBytes, "audio/wav")
+                            }
+                            if (screenBitmap != null) {
+                                image(screenBitmap)
+                            }
                             text(promptText)
                         }
                     )
@@ -225,41 +357,76 @@ class GeminiCommandService(
         }
 
         val allowedActionTypes = ActionType.entries.joinToString(", ") { it.name }
-        val fallbackPrompt = "$fullInstruction\n\nValid actionType values: $allowedActionTypes.\nRespond with a valid JSON object matching {\"reply\": string, \"needsScreenObservation\": boolean, \"continueLoopAfterAction\": boolean, \"steps\": [{\"stepId\": string, \"dependsOn\": [string], \"timeoutMs\": integer, \"actionType\": string, \"label\": string, \"target\": string, \"textPayload\": string, \"intValue\": integer, \"doubleValue\": number, \"boolValue\": boolean, \"isBackgroundParallel\": boolean, \"isSensitive\": boolean}]}."
+        val fallbackPrompt = "$fullInstruction\n\nValid actionType values: $allowedActionTypes.\nRespond with a valid JSON object matching {\"reply\": string, \"needsScreenObservation\": boolean, \"continueLoopAfterAction\": boolean, \"steps\": [{\"stepId\": string, \"dependsOn\": [string], \"timeoutMs\": integer, \"actionType\": string, \"label\": string, \"target\": string, \"recipient\": string, \"textPayload\": string, \"intValue\": integer, \"secondaryIntValue\": integer, \"doubleValue\": number, \"boolValue\": boolean, \"isBackgroundParallel\": boolean, \"isSensitive\": boolean}]}."
 
-        // Direct NVIDIA NIM streaming path when user enabled NVIDIA API directly, or Gemini project billing is unavailable
-        if ((preferNvidiaPrimary || geminiBillingUnavailable) && nvidiaFallback.isConfigured()) {
-            val directPrompt = if (screenBitmap != null && ocrSummary.isNullOrBlank()) {
-                "$fallbackPrompt\n[Note: Image attached; use ACTIVE SCREEN UI TREE or ON-DEVICE OCR FALLBACK coordinates if available.]"
-            } else {
-                fallbackPrompt
-            }
-            val nvidiaResult = nvidiaFallback.generateCommandJson(
-                systemPersonaPrompt = persona.stylePrompt,
-                fullPrompt = directPrompt,
-                onStreamPartial = onStreamingReply,
-                onModelUsed = onActiveModelChanged
-            )
-            nvidiaResult.onSuccess { rawNvidia ->
-                return Result.success(parseCommandPlanOrPlainReply(rawNvidia))
-            }.onFailure { nvidiaErr ->
-                Log.e(TAG, "Direct NVIDIA NIM request failed: ${nvidiaErr.message}", nvidiaErr)
-                return Result.failure(
-                    IllegalStateException(nvidiaErr.localizedMessage ?: "NVIDIA NIM request failed.")
-                )
-            }
+        val directPrompt = if (screenBitmap != null && ocrSummary.isNullOrBlank()) {
+            "$fallbackPrompt\n[Note: Screen context is for silent background action targeting only. Do NOT describe what is on screen in 'reply' unless the user explicitly asked about the screen; answer only what the user asked.]"
+        } else {
+            fallbackPrompt
         }
 
-        // Ordered Multi-Model Gemini Chain with live streaming + cooldown bypass
         val geminiTiers = listOf(
-            Triple("gemini-3.8-flash-schema", "Gemini 3.8 Flash", plannerModel to fullInstruction),
-            Triple("gemini-3.8-flash-free", "Gemini 3.8 Flash", unconstrainedModel to fallbackPrompt),
-            Triple("gemini-3.5-flash-lite", "Gemini 3.5 Lite", fallbackLiteModel to fallbackPrompt)
+            Triple("gemini-3.8-flash-schema", "Gemini 3.8 Flash", Triple({ plannerModel }, fullInstruction, 60_000L)),
+            Triple("gemini-3.8-flash-free", "Gemini 3.8 Flash", Triple({ unconstrainedModel }, fallbackPrompt, 45_000L)),
+            Triple("gemini-3.5-flash-lite", "Gemini 3.5 Lite", Triple({ fallbackLiteModel }, fallbackPrompt, 45_000L))
         )
 
+        return routePrimaryAndFallback(
+            audioWavBytes = audioWavBytes,
+            preferNvidiaPrimary = preferNvidiaPrimary,
+            nvidiaConfigured = nvidiaFallback.isConfigured(),
+            geminiBillingUnavailable = geminiBillingUnavailable && !directGeminiClient.isConfigured(),
+            tryNvidia = {
+                nvidiaFallback.generateCommandJson(
+                    systemPersonaPrompt = persona.stylePrompt,
+                    fullPrompt = directPrompt,
+                    conversationHistory = conversationTurns,
+                    onStreamPartial = onStreamingReply,
+                    onModelUsed = onActiveModelChanged
+                ).map { rawNvidia -> parseCommandPlanOrPlainReply(rawNvidia) }
+            },
+            tryGemini = {
+                if (directGeminiClient.isConfigured()) {
+                    onActiveModelChanged?.invoke("Gemini Key · ${directGeminiClient.currentModelId()}")
+                    val customRes = directGeminiClient.generateJsonOrText(
+                        prompt = fallbackPrompt,
+                        conversationHistory = conversationTurns,
+                        bitmap = screenBitmap,
+                        audioWavBytes = audioWavBytes,
+                        temperature = 0.35f,
+                        expectJson = true
+                    ).map { raw -> parseCommandPlanOrPlainReply(raw) }
+                    if (customRes.isSuccess) {
+                        return@routePrimaryAndFallback customRes
+                    }
+                    Log.w(TAG, "Direct Gemini API key call failed (${customRes.exceptionOrNull()?.message}); falling back to Firebase AI Logic.")
+                }
+                if (geminiBillingUnavailable) {
+                    Result.failure(IllegalStateException("Firebase Gemini billing unavailable and direct key failed."))
+                } else {
+                    runGeminiChain(
+                        geminiTiers = geminiTiers,
+                        invokeModelStreaming = ::invokeModelStreaming,
+                        onActiveModelChanged = onActiveModelChanged
+                    )
+                }
+            },
+            extractError = ::extractReadableError,
+            onLogWarning = { msg -> runCatching { Log.w(TAG, msg) } }
+        )
+    }
+
+    private suspend fun runGeminiChain(
+        geminiTiers: List<Triple<String, String, Triple<() -> GenerativeModel, String, Long>>>,
+        invokeModelStreaming: suspend (String, GenerativeModel, String, Long) -> String,
+        onActiveModelChanged: ((String) -> Unit)?
+    ): Result<CommandPlan> {
         var primaryError: Exception? = null
         val nowMs = System.currentTimeMillis()
-        for ((tierKey, displayLabel, modelPair) in geminiTiers) {
+        for ((index, tier) in geminiTiers.withIndex()) {
+            val (tierKey, displayLabel, spec) = tier
+            val (modelProvider, promptText, timeoutMs) = spec
+            val hasMoreTiers = index < geminiTiers.lastIndex
             val cooldownUntil = modelCooldownUntilMs[tierKey] ?: 0L
             if (cooldownUntil > nowMs) {
                 Log.d(TAG, "Skipping $tierKey (in cooldown for ${(cooldownUntil - nowMs) / 1000}s)")
@@ -267,7 +434,8 @@ class GeminiCommandService(
             }
             onActiveModelChanged?.invoke(displayLabel)
             try {
-                val rawOut = invokeModelStreaming(tierKey, modelPair.first, modelPair.second)
+                val model = modelProvider()
+                val rawOut = invokeModelStreaming(tierKey, model, promptText, timeoutMs)
                 if (rawOut.isNotBlank()) {
                     val parsed = if (tierKey.endsWith("-schema")) {
                         parseCommandPlan(rawOut)
@@ -281,17 +449,25 @@ class GeminiCommandService(
                 }
             } catch (e: CancellationException) {
                 if (e !is TimeoutCancellationException) throw e
-                Log.e(TAG, "$tierKey timed out", e)
+                if (hasMoreTiers) {
+                    Log.w(TAG, "$tierKey timed out after ${timeoutMs}ms; trying fallback tier")
+                } else {
+                    Log.w(TAG, "$tierKey timed out after ${timeoutMs}ms")
+                }
                 modelCooldownUntilMs[tierKey] = System.currentTimeMillis() + 30_000L
                 if (primaryError == null) primaryError = e
             } catch (e: Exception) {
                 if (isBillingUnavailableError(e)) {
                     geminiBillingUnavailable = true
-                    Log.w(TAG, "Gemini project free tier unavailable; routing to NVIDIA NIM fallback.")
+                    Log.w(TAG, "Gemini project free tier unavailable.")
                     primaryError = e
                     break
                 }
-                Log.e(TAG, "$tierKey failed (${e.javaClass.simpleName}): ${e.message}", e)
+                if (hasMoreTiers && !isNonRetryableGeminiError(e)) {
+                    Log.w(TAG, "$tierKey failed (${e.javaClass.simpleName}): ${e.message}; trying fallback tier")
+                } else {
+                    Log.e(TAG, "$tierKey failed (${e.javaClass.simpleName}): ${e.message}", e)
+                }
                 if (primaryError == null) primaryError = e
                 if (isNonRetryableGeminiError(e)) {
                     break
@@ -300,33 +476,9 @@ class GeminiCommandService(
                 }
             }
         }
-
-        // Final fallback tier: NVIDIA NIM multi-model SSE streaming
-        if (nvidiaFallback.isConfigured()) {
-            Log.w(TAG, "Gemini chain unavailable (${primaryError?.message}); routing to NVIDIA NIM streaming fallback.")
-            val nvidiaResult = nvidiaFallback.generateCommandJson(
-                systemPersonaPrompt = persona.stylePrompt,
-                fullPrompt = fallbackPrompt,
-                onStreamPartial = onStreamingReply,
-                onModelUsed = onActiveModelChanged
-            )
-            nvidiaResult.onSuccess { rawNvidia ->
-                return Result.success(parseCommandPlanOrPlainReply(rawNvidia))
-            }.onFailure { nvidiaErr ->
-                Log.e(TAG, "NVIDIA NIM fallback also failed: ${nvidiaErr.message}", nvidiaErr)
-                return Result.failure(
-                    IllegalStateException(
-                        "${extractReadableError(primaryError)} | NVIDIA fallback: ${nvidiaErr.localizedMessage}"
-                    )
-                )
-            }
-        }
-
-        val geminiErrMsg = extractReadableError(primaryError)
-        val hint = if (!nvidiaFallback.isConfigured()) {
-            " Tap Configure NVIDIA API & Key below to enter your NVIDIA API key directly in the app."
-        } else ""
-        return Result.failure(IllegalStateException("$geminiErrMsg$hint"))
+        return Result.failure(
+            primaryError ?: IllegalStateException("Gemini AI request failed. Check internet connection.")
+        )
     }
 
     private fun isBillingUnavailableError(e: Exception): Boolean {
@@ -340,6 +492,7 @@ class GeminiCommandService(
     internal fun isNonRetryableGeminiError(e: Exception): Boolean {
         val msg = ((e.message ?: "") + " " + (e.cause?.message ?: "")).lowercase()
         return isBillingUnavailableError(e) ||
+            msg.contains("default firebaseapp is not initialized") ||
             msg.contains("unknownhost") ||
             msg.contains("unable to resolve host") ||
             msg.contains("failed to connect") ||
@@ -352,12 +505,21 @@ class GeminiCommandService(
     }
 
     internal fun extractReadableError(e: Exception?): String {
+        if (e is TimeoutCancellationException) {
+            return "Gemini request timed out. Check your internet connection or configure your NVIDIA API key."
+        }
         val raw = e?.cause?.localizedMessage?.takeIf { it.isNotBlank() }
             ?: e?.localizedMessage?.takeIf { it.isNotBlank() }
             ?: return "Gemini AI request failed. Check internet connection."
         val lower = raw.lowercase()
+        if (lower.contains("default firebaseapp is not initialized")) {
+            return "Firebase is not initialized yet for Gemini fallback. Configure an NVIDIA API key or restart the app."
+        }
         if (lower.contains("free tier is not available") || lower.contains("set up billing")) {
             return "Gemini free tier is unavailable for this Firebase project. Set up billing at https://aistudio.google.com/billing"
+        }
+        if (lower.contains("timed out waiting for")) {
+            return "Gemini request timed out. Check your internet connection or configure your NVIDIA API key."
         }
         return raw
     }
@@ -366,7 +528,7 @@ class GeminiCommandService(
         userPrompt: String,
         persona: AssistantPersona,
         toolOutputs: List<String>,
-        preferNvidiaPrimary: Boolean = false,
+        preferNvidiaPrimary: Boolean = true,
         onStreamPartial: ((String) -> Unit)? = null
     ): String? {
         if (toolOutputs.isEmpty()) return null
@@ -377,29 +539,52 @@ class GeminiCommandService(
             toolOutputs.forEachIndexed { idx, line -> appendLine("${idx + 1}. $line") }
             appendLine("Produce a crisp, natural spoken summary (max 2-3 sentences) combining these live facts accurately.")
         }
-        if ((preferNvidiaPrimary || geminiBillingUnavailable) && nvidiaFallback.isConfigured()) {
-            return nvidiaFallback.synthesizeSummary(persona.stylePrompt, prompt, onStreamPartial)
+        if (preferNvidiaPrimary && nvidiaFallback.isConfigured()) {
+            val primarySummary = nvidiaFallback.synthesizeSummary(persona.stylePrompt, prompt, onStreamPartial)
+            if (!primarySummary.isNullOrBlank()) {
+                return primarySummary
+            }
+            Log.w(TAG, "Primary NVIDIA tool summary unavailable; falling back to Gemini.")
         }
-        try {
-            val sb = StringBuilder()
-            withTimeout(25_000L) {
-                summaryModel.generateContentStream(prompt).collect { chunk ->
-                    val piece = chunk.text.orEmpty()
-                    if (piece.isNotEmpty()) {
-                        sb.append(piece)
-                        onStreamPartial?.invoke(sb.toString().trim())
+        if (directGeminiClient.isConfigured()) {
+            val directSummary = directGeminiClient.generateJsonOrText(
+                prompt = prompt,
+                temperature = 0.45f,
+                expectJson = false
+            ).getOrNull()
+            if (!directSummary.isNullOrBlank()) {
+                onStreamPartial?.invoke(directSummary)
+                return directSummary
+            }
+        }
+        if (!geminiBillingUnavailable) {
+            try {
+                val sb = StringBuilder()
+                withTimeout(45_000L) {
+                    summaryModel.generateContentStream(prompt).collect { chunk ->
+                        val piece = chunk.text.orEmpty()
+                        if (piece.isNotEmpty()) {
+                            sb.append(piece)
+                            onStreamPartial?.invoke(sb.toString().trim())
+                        }
                     }
                 }
+                val text = sb.toString().trim()
+                if (text.isNotBlank()) return text
+            } catch (e: CancellationException) {
+                if (e !is TimeoutCancellationException) throw e
+                Log.w(TAG, "Tool summary via Gemini timed out")
+            } catch (e: Exception) {
+                if (isBillingUnavailableError(e)) {
+                    geminiBillingUnavailable = true
+                }
+                Log.w(TAG, "Failed to synthesize tool summary via Gemini: ${e.message}")
             }
-            val text = sb.toString().trim()
-            if (text.isNotBlank()) return text
-        } catch (e: CancellationException) {
-            if (e !is TimeoutCancellationException) throw e
-            Log.e(TAG, "Tool summary timed out", e)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to synthesize tool summary via Gemini", e)
         }
-        return nvidiaFallback.synthesizeSummary(persona.stylePrompt, prompt, onStreamPartial)
+        if (!preferNvidiaPrimary && nvidiaFallback.isConfigured()) {
+            return nvidiaFallback.synthesizeSummary(persona.stylePrompt, prompt, onStreamPartial)
+        }
+        return null
     }
 
     internal fun parseCommandPlanOrPlainReply(rawOutput: String): CommandPlan {
@@ -413,8 +598,8 @@ class GeminiCommandService(
         if (firstBrace >= 0 && lastBrace > firstBrace) {
             val candidate = unwrapped.substring(firstBrace, lastBrace + 1)
             runCatching {
-                val obj = JSONObject(candidate)
-                if (obj.has("reply") || obj.has("steps")) {
+                val obj = lenientJson.parseToJsonElement(candidate).jsonObject
+                if (obj.containsKey("reply") || obj.containsKey("steps")) {
                     return parseCommandPlan(candidate)
                 }
             }
@@ -428,23 +613,35 @@ class GeminiCommandService(
     }
 
     internal fun parseCommandPlan(rawJson: String): CommandPlan {
-        val root = JSONObject(rawJson)
+        val root = lenientJson.parseToJsonElement(rawJson).jsonObject
+        val transcript = root.optCleanString("transcript", "")
         val reply = root.optCleanString("reply", "On it.")
         val needsScreen = root.optBoolean("needsScreenObservation", false)
         val continueLoop = root.optBoolean("continueLoopAfterAction", false)
-        val stepsArray = root.optJSONArray("steps") ?: JSONArray()
+        val subGoalsArray = root["subGoals"] as? JsonArray
+        val subGoals = buildList {
+            if (subGoalsArray != null) {
+                for (gElem in subGoalsArray) {
+                    val prim = gElem as? JsonPrimitive ?: continue
+                    val goalText = if (prim is JsonNull) "" else prim.content.trim()
+                    if (goalText.isNotBlank() && goalText != "null") add(goalText)
+                }
+            }
+        }
+        val stepsArray = (root["steps"] as? JsonArray) ?: JsonArray(emptyList())
 
         val steps = buildList {
-            for (i in 0 until stepsArray.length()) {
-                val obj = stepsArray.optJSONObject(i) ?: continue
+            for (elem in stepsArray) {
+                val obj = elem as? JsonObject ?: continue
                 val typeName = obj.optCleanString("actionType", ActionType.SPEAK_ONLY.name)
                 val actionType = ActionType.entries.firstOrNull { it.name == typeName }
                     ?: ActionType.SPEAK_ONLY
-                val depsArray = obj.optJSONArray("dependsOn")
+                val depsArray = obj["dependsOn"] as? JsonArray
                 val deps = buildList {
                     if (depsArray != null) {
-                        for (d in 0 until depsArray.length()) {
-                            val depId = depsArray.optString(d, "").trim()
+                        for (depElem in depsArray) {
+                            val prim = depElem as? JsonPrimitive ?: continue
+                            val depId = if (prim is JsonNull) "" else prim.content.trim()
                             if (depId.isNotBlank() && depId != "null") add(depId)
                         }
                     }
@@ -455,15 +652,16 @@ class GeminiCommandService(
                         label = obj.optCleanString("label", actionType.name.replace("_", " ")),
                         target = obj.optCleanString("target", ""),
                         textPayload = obj.optCleanString("textPayload", ""),
-                        intValue = if (obj.isNull("intValue")) 0 else obj.optInt("intValue", 0),
-                        secondaryIntValue = if (obj.isNull("secondaryIntValue")) 0 else obj.optInt("secondaryIntValue", 0),
-                        doubleValue = if (obj.isNull("doubleValue")) 0.0 else obj.optDouble("doubleValue", 0.0).let { if (it.isNaN()) 0.0 else it },
-                        boolValue = !obj.isNull("boolValue") && obj.optBoolean("boolValue", false),
-                        isBackgroundParallel = !obj.isNull("isBackgroundParallel") && obj.optBoolean("isBackgroundParallel", false),
-                        isSensitive = !obj.isNull("isSensitive") && obj.optBoolean("isSensitive", false),
+                        recipient = obj.optCleanString("recipient", ""),
+                        intValue = obj.optInt("intValue", 0),
+                        secondaryIntValue = obj.optInt("secondaryIntValue", 0),
+                        doubleValue = obj.optDouble("doubleValue", 0.0).let { if (it.isNaN()) 0.0 else it },
+                        boolValue = obj.optBoolean("boolValue", false),
+                        isBackgroundParallel = obj.optBoolean("isBackgroundParallel", false),
+                        isSensitive = obj.optBoolean("isSensitive", false),
                         stepId = obj.optCleanString("stepId", ""),
                         dependsOn = deps,
-                        timeoutMs = if (obj.isNull("timeoutMs")) 0L else obj.optLong("timeoutMs", 0L).coerceAtLeast(0L)
+                        timeoutMs = obj.optLong("timeoutMs", 0L).coerceAtLeast(0L)
                     )
                 )
             }
@@ -473,16 +671,107 @@ class GeminiCommandService(
             reply = reply,
             needsScreenObservation = needsScreen,
             continueLoopAfterAction = continueLoop,
+            subGoals = subGoals,
             steps = if (steps.isEmpty()) {
                 listOf(PlannedStep(ActionType.SPEAK_ONLY, "Respond"))
             } else {
                 steps
-            }
+            },
+            recognizedTranscript = transcript
         )
     }
 
-    private fun JSONObject.optCleanString(key: String, fallback: String): String {
-        if (!has(key) || isNull(key)) return fallback
-        return optString(key, fallback).takeUnless { it == "null" } ?: fallback
+    private fun JsonObject.optCleanString(key: String, fallback: String): String {
+        val prim = this[key] as? JsonPrimitive ?: return fallback
+        if (prim is JsonNull) return fallback
+        return prim.content.takeUnless { it == "null" } ?: fallback
+    }
+
+    private fun JsonObject.optBoolean(key: String, fallback: Boolean): Boolean {
+        val prim = this[key] as? JsonPrimitive ?: return fallback
+        if (prim is JsonNull) return fallback
+        return prim.booleanOrNull ?: fallback
+    }
+
+    private fun JsonObject.optInt(key: String, fallback: Int): Int {
+        val prim = this[key] as? JsonPrimitive ?: return fallback
+        if (prim is JsonNull) return fallback
+        return prim.intOrNull ?: prim.doubleOrNull?.toInt() ?: fallback
+    }
+
+    private fun JsonObject.optLong(key: String, fallback: Long): Long {
+        val prim = this[key] as? JsonPrimitive ?: return fallback
+        if (prim is JsonNull) return fallback
+        return prim.longOrNull ?: prim.doubleOrNull?.toLong() ?: fallback
+    }
+
+    private fun JsonObject.optDouble(key: String, fallback: Double): Double {
+        val prim = this[key] as? JsonPrimitive ?: return fallback
+        if (prim is JsonNull) return fallback
+        return prim.doubleOrNull ?: fallback
+    }
+
+    private val lenientJson = Json { ignoreUnknownKeys = true; isLenient = true }
+
+    companion object {
+        internal suspend fun routePrimaryAndFallback(
+            audioWavBytes: ByteArray?,
+            preferNvidiaPrimary: Boolean,
+            nvidiaConfigured: Boolean,
+            geminiBillingUnavailable: Boolean = false,
+            tryNvidia: suspend () -> Result<CommandPlan>,
+            tryGemini: suspend () -> Result<CommandPlan>,
+            extractError: (Exception?) -> String = { e ->
+                e?.localizedMessage?.takeIf { it.isNotBlank() } ?: "Gemini AI request failed. Check internet connection."
+            },
+            onLogWarning: (String) -> Unit = {}
+        ): Result<CommandPlan> {
+            var nvidiaPrimaryError: Throwable? = null
+            if (audioWavBytes == null && preferNvidiaPrimary && nvidiaConfigured) {
+                val nvidiaResult = tryNvidia()
+                if (nvidiaResult.isSuccess) {
+                    return nvidiaResult
+                }
+                nvidiaPrimaryError = nvidiaResult.exceptionOrNull()
+                onLogWarning("Primary NVIDIA NIM request failed (${nvidiaPrimaryError?.message}); falling back to Gemini.")
+            }
+
+            val geminiResult = if (geminiBillingUnavailable) {
+                Result.failure(IllegalStateException("Gemini free tier is unavailable for this Firebase project."))
+            } else {
+                tryGemini()
+            }
+            if (geminiResult.isSuccess) {
+                return geminiResult
+            }
+            val geminiErr = geminiResult.exceptionOrNull() as? Exception
+
+            if (audioWavBytes == null && !preferNvidiaPrimary && nvidiaConfigured) {
+                onLogWarning("Gemini chain unavailable (${geminiErr?.message}); routing to NVIDIA NIM fallback.")
+                val nvidiaFallbackRes = tryNvidia()
+                if (nvidiaFallbackRes.isSuccess) {
+                    return nvidiaFallbackRes
+                }
+                val nvidiaErr = nvidiaFallbackRes.exceptionOrNull()
+                return Result.failure(
+                    IllegalStateException(
+                        "${extractError(geminiErr)} | NVIDIA fallback: ${nvidiaErr?.localizedMessage ?: nvidiaErr?.message}"
+                    )
+                )
+            }
+
+            val geminiErrMsg = extractError(geminiErr)
+            if (nvidiaPrimaryError != null) {
+                return Result.failure(
+                    IllegalStateException(
+                        "NVIDIA primary: ${nvidiaPrimaryError.localizedMessage ?: nvidiaPrimaryError.message} | Gemini fallback: $geminiErrMsg"
+                    )
+                )
+            }
+            val hint = if (!nvidiaConfigured) {
+                " Tap Configure NVIDIA API & Key below to set your NVIDIA API key as primary AI."
+            } else ""
+            return Result.failure(IllegalStateException("$geminiErrMsg$hint"))
+        }
     }
 }

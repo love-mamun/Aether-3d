@@ -58,10 +58,10 @@ class VoiceAgentService : Service() {
             }
             ACTION_TOGGLE_PAUSE -> {
                 isPaused = !isPaused
+                orchestrator.setBackgroundServiceState(active = true, paused = isPaused)
                 if (isPaused) {
                     orchestrator.stopListening()
                 }
-                orchestrator.setBackgroundServiceState(active = true, paused = isPaused)
             }
             ACTION_SHOW_OVERLAY -> {
                 overlayDismissedByUser = false
@@ -85,6 +85,7 @@ class VoiceAgentService : Service() {
 
         if (!hasMic) {
             Log.w("VoiceAgentService", "RECORD_AUDIO missing; cannot run microphone foreground service")
+            orchestrator.stopFilteredBackgroundCapture()
             orchestrator.setBackgroundServiceState(active = false, paused = false)
             stopSelf()
             return START_NOT_STICKY
@@ -100,9 +101,23 @@ class VoiceAgentService : Service() {
             ServiceCompat.startForeground(this, NOTIFICATION_ID, initialNotif, fgsType)
         } catch (se: SecurityException) {
             Log.e("VoiceAgentService", "startForeground rejected by OS", se)
+            orchestrator.stopFilteredBackgroundCapture()
             orchestrator.setBackgroundServiceState(active = false, paused = false)
             stopSelf()
             return START_NOT_STICKY
+        } catch (e: Exception) {
+            Log.e("VoiceAgentService", "startForeground failed", e)
+            orchestrator.stopFilteredBackgroundCapture()
+            orchestrator.setBackgroundServiceState(active = false, paused = false)
+            stopSelf()
+            return START_NOT_STICKY
+        }
+
+        if (isPaused) {
+            orchestrator.stopFilteredBackgroundCapture()
+            orchestrator.voiceManager.stopWakeWordListening()
+        } else {
+            orchestrator.ensureBackgroundStandbyListening()
         }
 
         ensureOverlayAttached(orchestrator)
@@ -114,7 +129,7 @@ class VoiceAgentService : Service() {
 
                     val activeCount = state.activeTasks.size
                     val doneCount = state.activeTasks.count { it.status.name == "DONE" }
-                    val notifKey = "${isPaused}|${state.preferences.persona.name}|${state.coreMode.name}|$doneCount/$activeCount"
+                    val notifKey = "${isPaused}|${state.preferences.persona.name}|${state.coreMode.name}|$doneCount/$activeCount|${state.isWakeWordArmed}|${state.audioFilterDiagnostics.isCapturing}"
                     if (notifKey != lastNotificationStatus) {
                         lastNotificationStatus = notifKey
                         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -123,12 +138,22 @@ class VoiceAgentService : Service() {
 
                     if (!overlayDismissedByUser && Settings.canDrawOverlays(this@VoiceAgentService)) {
                         ensureOverlayAttached(orchestrator)
+                        val reactStep = if (state.reActSubGoals.isNotEmpty()) {
+                            val idx = (state.reActActiveSubGoalIndex + 1).coerceAtMost(state.reActSubGoals.size)
+                            "Step $idx/${state.reActSubGoals.size} · ${state.reActProgressLabel.ifBlank { state.latestReply }}"
+                        } else {
+                            ""
+                        }
                         val bubbleText = when {
                             state.isMacroRecording -> "Recording Macro (${state.macroStepCount} steps)..."
                             state.isLiveDuplexActive -> "Live Duplex · ${state.liveDuplexLabel}"
                             state.partialTranscript.isNotBlank() -> state.partialTranscript
                             state.errorMessage != null -> state.errorMessage
-                            state.coreMode == CoreMode.MULTITASKING -> "Running $doneCount/$activeCount..."
+                            reactStep.isNotBlank() &&
+                                (state.coreMode == CoreMode.MULTITASKING || state.coreMode == CoreMode.OBSERVING_SCREEN || state.reActWaitingForLoad) ->
+                                reactStep
+                            state.coreMode == CoreMode.MULTITASKING || state.coreMode == CoreMode.OBSERVING_SCREEN ->
+                                state.latestReply.ifBlank { "Running step $doneCount/$activeCount..." }
                             state.coreMode == CoreMode.IDLE -> state.latestReply
                             else -> state.coreMode.statusLabel
                         }
@@ -136,9 +161,11 @@ class VoiceAgentService : Service() {
                             coreMode = state.coreMode,
                             persona = state.preferences.persona,
                             message = bubbleText,
-                            showBubble = state.coreMode != CoreMode.IDLE || state.isMacroRecording || state.isLiveDuplexActive || state.lastUserPrompt.isNotBlank(),
+                            showBubble = state.coreMode != CoreMode.IDLE || state.isMacroRecording || state.isLiveDuplexActive || state.lastUserPrompt.isNotBlank() || state.reActWaitingForLoad,
                             isMacroRecording = state.isMacroRecording,
-                            macroStepCount = state.macroStepCount
+                            macroStepCount = state.macroStepCount,
+                            visionSource = state.screenVisionSourceLabel,
+                            isWaitingForLoad = state.reActWaitingForLoad
                         )
                     }
                 }
@@ -173,6 +200,9 @@ class VoiceAgentService : Service() {
                 onBriefingTapped = {
                     orchestrator.runDailyBriefing()
                 },
+                onAbortTask = {
+                    orchestrator.abortAllTasks()
+                },
                 onStopOverlay = {
                     overlayDismissedByUser = true
                     floatingOverlay?.hide()
@@ -185,7 +215,9 @@ class VoiceAgentService : Service() {
     override fun onDestroy() {
         floatingOverlay?.hide()
         floatingOverlay = null
-        AgentOrchestrator.getInstance(this).setBackgroundServiceState(active = false, paused = false)
+        val orchestrator = AgentOrchestrator.getInstance(this)
+        orchestrator.stopFilteredBackgroundCapture()
+        orchestrator.setBackgroundServiceState(active = false, paused = false)
         stateObserverJob?.cancel()
         serviceScope.cancel()
         super.onDestroy()
@@ -198,11 +230,17 @@ class VoiceAgentService : Service() {
         val activeCount = state.activeTasks.size
         val doneCount = state.activeTasks.count { it.status.name == "DONE" }
 
+        val standbyLabel = when {
+            state.audioFilterDiagnostics.isCapturing -> "Filtered Mic Active"
+            state.isWakeWordArmed -> "Say \"${state.preferences.customWakeWord}\""
+            else -> "Standby Ready"
+        }
+
         val statusText = when {
             isPaused -> "Agent Paused — Tap Resume or Speak"
             activeCount > 0 && state.coreMode == CoreMode.MULTITASKING ->
-                "Multitasking ($doneCount/$activeCount): ${state.activeTasks.firstOrNull { it.status.name == "RUNNING" }?.step?.label ?: "Running"}"
-            else -> "${state.preferences.persona.displayName} · ${state.coreMode.statusLabel}"
+                "Working ($doneCount/$activeCount): ${state.latestReply.ifBlank { state.activeTasks.firstOrNull { it.status.name == "RUNNING" }?.step?.label ?: "Running" }}"
+            else -> "${state.preferences.persona.displayName} · $standbyLabel"
         }
 
         val openAppIntent = PendingIntent.getActivity(

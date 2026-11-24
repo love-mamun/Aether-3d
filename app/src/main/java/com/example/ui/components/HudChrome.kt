@@ -8,6 +8,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -19,6 +20,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -37,6 +39,7 @@ import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.Sync
 import androidx.compose.material.icons.filled.TimerOff
 import androidx.compose.material.icons.filled.VerifiedUser
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -61,6 +64,7 @@ import com.example.ai.ActiveTaskItem
 import com.example.ai.CoreMode
 import com.example.ai.TaskStatus
 import com.example.core.AssistantUiState
+import com.example.data.local.WakeTriggerMode
 import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.HudTextPrimary
 import com.example.ui.theme.HudTextSecondary
@@ -181,70 +185,11 @@ fun TopTelemetryBar(
             }
         }
 
-        // Right: Voice Studio + NVIDIA NIM API + Permissions Readiness + SQLite Vault
+        // Right: Compact Permissions Readiness + SQLite Vault (Voice & API live inside Bottom-Right Settings)
         Row(
-            horizontalArrangement = Arrangement.spacedBy(5.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            val piperReady = uiState.voicePacks.any { it.status == com.example.voice.VoicePackStatus.READY }
-            val voiceColor = if (piperReady) StealthEmerald else accent
-            Surface(
-                color = SmokedGlass,
-                shape = RoundedCornerShape(20.dp),
-                border = BorderStroke(1.dp, voiceColor.copy(alpha = 0.5f)),
-                modifier = Modifier
-                    .minimumInteractiveComponentSize()
-                    .testTag("voice_studio_button")
-                    .clickable(onClick = onOpenVoiceStudio)
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.GraphicEq,
-                        contentDescription = "Neural Voice Studio",
-                        tint = voiceColor,
-                        modifier = Modifier.size(16.dp)
-                    )
-                }
-            }
-
-            val nimConfigured = uiState.isNvidiaConfigured || uiState.preferences.nvidiaApiKey.isNotBlank()
-            val nimActive = nimConfigured && uiState.preferences.preferNvidiaPrimary
-            val nimColor = when {
-                nimActive -> StealthEmerald
-                nimConfigured -> accent
-                else -> SolarGold
-            }
-            Surface(
-                color = SmokedGlass,
-                shape = RoundedCornerShape(20.dp),
-                border = BorderStroke(1.dp, nimColor.copy(alpha = 0.55f)),
-                modifier = Modifier
-                    .minimumInteractiveComponentSize()
-                    .testTag("nvidia_api_button")
-                    .clickable(onClick = onOpenApiSettings)
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 9.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Key,
-                        contentDescription = "NVIDIA API & Key",
-                        tint = nimColor,
-                        modifier = Modifier.size(15.dp)
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        text = if (nimActive) "NIM" else "API",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = nimColor
-                    )
-                }
-            }
-
             val allGranted = perms.allEnabled
             val permColor = if (allGranted) StealthEmerald else SolarGold
             Surface(
@@ -328,17 +273,21 @@ fun CoreStatusAndReplyOverlay(
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        // Core Mode Status Badge + Wake-Word / Macro Recording / Echo Shield Indicator
+        // Core Mode Status Badge + Wake-Word / Assistant Button / Macro Recording / Echo Shield Indicator
+        val isButtonOnlyIdle = uiState.preferences.wakeTriggerMode == WakeTriggerMode.ASSISTANT_BUTTON_ONLY &&
+            uiState.coreMode == CoreMode.IDLE
         val badgeText = when {
             uiState.isMacroRecording -> "REC MACRO · ${uiState.macroStepCount} STEPS"
             uiState.echoGuardActive -> "ECHO SHIELD · AEC GUARD"
+            isButtonOnlyIdle -> "ASSISTANT READY · TAP ORB / TILE"
             uiState.isWakeWordArmed && uiState.coreMode == CoreMode.IDLE ->
-                "WAKE ARMED · SAY \"${uiState.preferences.customWakeWord.uppercase()}\""
+                "SAY \"${uiState.preferences.customWakeWord.uppercase()}\" · ${uiState.kwsPackStatusLabel.uppercase()}"
             else -> uiState.coreMode.statusLabel
         }
         val badgeColor = when {
             uiState.isMacroRecording -> AlertCoral
             uiState.echoGuardActive -> StealthEmerald
+            isButtonOnlyIdle -> accent
             uiState.isWakeWordArmed && uiState.coreMode == CoreMode.IDLE -> StealthEmerald
             else -> accent
         }
@@ -357,12 +306,89 @@ fun CoreStatusAndReplyOverlay(
             )
         }
 
-        // Compact AI Model & Region-Crop / OCR Vision Telemetry Chips
-        if (uiState.activeAiModelLabel.isNotBlank() || uiState.visionInsightLabel.isNotBlank()) {
+        // Compact AI Model, Active Vision Source, Token Saver & Audio Filter Telemetry Chips (hidden when idle)
+        val filterDiag = uiState.audioFilterDiagnostics
+        val showVisionChip = uiState.screenVisionSourceLabel.isNotBlank() &&
+            (uiState.coreMode == CoreMode.OBSERVING_SCREEN ||
+                uiState.coreMode == CoreMode.MULTITASKING ||
+                uiState.reActWaitingForLoad ||
+                uiState.isDeepVisionActive)
+        val showTokensSavedChip = uiState.estimatedTokensSavedSession > 0L
+        if (uiState.activeAiModelLabel.isNotBlank() || filterDiag.isCapturing || showVisionChip || showTokensSavedChip) {
             Row(
+                modifier = Modifier.horizontalScroll(rememberScrollState()),
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
+                if (showVisionChip) {
+                    Surface(
+                        color = SmokedGlass,
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(1.dp, SolarGold.copy(alpha = 0.55f)),
+                        modifier = Modifier.testTag("screen_vision_source_chip")
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Visibility,
+                                contentDescription = "Active background vision source",
+                                tint = SolarGold,
+                                modifier = Modifier.size(12.dp)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                text = uiState.screenVisionSourceLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = SolarGold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+                if (showTokensSavedChip) {
+                    Surface(
+                        color = SmokedGlass,
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(1.dp, StealthEmerald.copy(alpha = 0.55f)),
+                        modifier = Modifier.testTag("tokens_saved_chip")
+                    ) {
+                        Text(
+                            text = "SAVED ~${uiState.estimatedTokensSavedSession} TOK",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = StealthEmerald,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
+                        )
+                    }
+                }
+                if (filterDiag.isCapturing) {
+                    Surface(
+                        color = SmokedGlass,
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(
+                            1.dp,
+                            if (filterDiag.isSpeechDetected) StealthEmerald.copy(alpha = 0.65f) else accent.copy(alpha = 0.35f)
+                        ),
+                        modifier = Modifier.testTag("audio_filter_status_chip")
+                    ) {
+                        Text(
+                            text = if (filterDiag.isSpeechDetected) {
+                                "VOICE ISOLATED · ${filterDiag.effects.summaryBadge()}"
+                            } else {
+                                filterDiag.effects.summaryBadge()
+                            },
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (filterDiag.isSpeechDetected) StealthEmerald else accent,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
+                        )
+                    }
+                }
                 if (uiState.activeAiModelLabel.isNotBlank()) {
                     Surface(
                         color = SmokedGlass,
@@ -373,22 +399,6 @@ fun CoreStatusAndReplyOverlay(
                             text = uiState.activeAiModelLabel,
                             style = MaterialTheme.typography.labelSmall,
                             color = HudTextSecondary,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
-                        )
-                    }
-                }
-                if (uiState.visionInsightLabel.isNotBlank()) {
-                    Surface(
-                        color = SmokedGlass,
-                        shape = RoundedCornerShape(50),
-                        border = BorderStroke(1.dp, StealthEmerald.copy(alpha = 0.35f))
-                    ) {
-                        Text(
-                            text = uiState.visionInsightLabel,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = StealthEmerald,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp)
@@ -457,6 +467,107 @@ fun CoreStatusAndReplyOverlay(
                                 .testTag("cancel_sensitive_button")
                         ) {
                             Text("Cancel", color = AlertCoral)
+                        }
+                    }
+                }
+            }
+        }
+
+        // Unified ReAct Multi-Step Progress Card
+        val showReActCard = uiState.reActSubGoals.isNotEmpty() &&
+            (uiState.coreMode == CoreMode.OBSERVING_SCREEN ||
+                uiState.coreMode == CoreMode.MULTITASKING ||
+                uiState.reActWaitingForLoad)
+        AnimatedVisibility(visible = showReActCard) {
+            Surface(
+                color = SmokedGlassElevated,
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.dp, StealthEmerald.copy(alpha = 0.55f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("react_progress_card")
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        val stepIndexDisplay = (uiState.reActActiveSubGoalIndex + 1).coerceAtMost(uiState.reActSubGoals.size)
+                        Text(
+                            text = "AUTONOMOUS GOAL ($stepIndexDisplay/${uiState.reActSubGoals.size})",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = StealthEmerald
+                        )
+                        IconButton(
+                            onClick = onAbortTasks,
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("react_abort_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Close,
+                                contentDescription = "Abort autonomous goal",
+                                tint = AlertCoral,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+                    }
+                    if (uiState.reActWaitingForLoad) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .padding(bottom = 4.dp)
+                                .testTag("react_waiting_indicator")
+                        ) {
+                            CircularProgressIndicator(
+                                color = SolarGold,
+                                strokeWidth = 2.dp,
+                                modifier = Modifier.size(13.dp)
+                            )
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = "Waiting for screen to load...",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = SolarGold
+                            )
+                        }
+                    } else if (uiState.reActProgressLabel.isNotBlank()) {
+                        Text(
+                            text = uiState.reActProgressLabel,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = HudTextPrimary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.padding(bottom = 4.dp)
+                        )
+                    }
+                    Row(
+                        modifier = Modifier.horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        uiState.reActSubGoals.forEachIndexed { idx, goal ->
+                            val isDone = idx < uiState.reActActiveSubGoalIndex
+                            val isCurrent = idx == uiState.reActActiveSubGoalIndex
+                            val pillColor = when {
+                                isDone -> StealthEmerald
+                                isCurrent -> SolarGold
+                                else -> HudTextSecondary
+                            }
+                            Surface(
+                                color = pillColor.copy(alpha = if (isCurrent) 0.16f else 0.08f),
+                                shape = RoundedCornerShape(50),
+                                border = BorderStroke(1.dp, pillColor.copy(alpha = 0.45f))
+                            ) {
+                                Text(
+                                    text = "${idx + 1}. $goal",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = pillColor,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                )
+                            }
                         }
                     }
                 }
@@ -543,12 +654,12 @@ fun CoreStatusAndReplyOverlay(
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Key,
-                            contentDescription = "Configure NVIDIA API & Key",
+                            contentDescription = "Configure AI API Keys",
                             tint = accent,
                             modifier = Modifier.size(16.dp)
                         )
                         Spacer(Modifier.width(6.dp))
-                        Text("Configure NVIDIA API & Key", color = accent)
+                        Text("Configure Gemini / NVIDIA API", color = accent)
                     }
                 } else {
                     if (uiState.lastUserPrompt.isNotBlank()) {
@@ -569,7 +680,7 @@ fun CoreStatusAndReplyOverlay(
                         } else {
                             "Streaming neural plan..."
                         }
-                        uiState.coreMode == CoreMode.OBSERVING_SCREEN -> "Scanning region & OCR..."
+                        uiState.coreMode == CoreMode.OBSERVING_SCREEN -> "Observing screen..."
                         else -> uiState.latestReply
                     }
                     Text(

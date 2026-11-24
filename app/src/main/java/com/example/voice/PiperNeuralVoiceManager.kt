@@ -4,6 +4,8 @@ import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.media.PlaybackParams
+import android.net.Uri
 import android.os.Build
 import android.util.Log
 import com.example.ai.AssistantPersona
@@ -12,11 +14,18 @@ import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsVitsModelConfig
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -26,10 +35,14 @@ import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.util.concurrent.TimeUnit
+import kotlin.math.min
 import kotlin.math.sqrt
 
 private const val TAG = "PiperNeuralVoice"
+internal const val BUNDLED_STARTER_VOICE_ID = "en_US-amy-low-int8"
+internal const val CUSTOM_AETHER_VOICE_ID = "custom_aether_onnx"
 
 data class NeuralVoicePack(
     val id: String,
@@ -39,7 +52,9 @@ data class NeuralVoicePack(
     val downloadSizeMb: Float,
     val downloadUrl: String,
     val extractedFolderName: String,
-    val defaultSpeakerId: Int = 0
+    val defaultSpeakerId: Int = 0,
+    val isBundledAsset: Boolean = false,
+    val bundledAssetPath: String? = null
 )
 
 enum class VoicePackStatus {
@@ -57,23 +72,103 @@ data class VoicePackUiState(
     val errorMessage: String? = null
 )
 
+internal object PiperAudioUtils {
+    /**
+     * Converts normalized float PCM samples [-1f..1f] to little-endian 16-bit PCM bytes
+     * while computing normalized RMS amplitude [0f..1f] for waveform/orb animation.
+     */
+    fun floatFrameToPcm16(
+        samples: FloatArray,
+        offset: Int,
+        length: Int,
+        outBytes: ByteArray
+    ): Float {
+        var sumSq = 0.0
+        val count = length.coerceAtLeast(1)
+        for (i in 0 until length) {
+            val clipped = samples[offset + i].coerceIn(-1.0f, 1.0f)
+            sumSq += clipped * clipped
+            val s16 = (clipped * 32767.0f).toInt().coerceIn(-32768, 32767)
+            val byteIdx = i * 2
+            outBytes[byteIdx] = (s16 and 0xFF).toByte()
+            outBytes[byteIdx + 1] = ((s16 ushr 8) and 0xFF).toByte()
+        }
+        val rms = sqrt(sumSq / count).toFloat()
+        return (rms * 2.6f).coerceIn(0.08f, 1.0f)
+    }
+
+    fun splitSentencesForPipeline(text: String): List<String> {
+        val raw = text.trim()
+        if (raw.isBlank()) return emptyList()
+        val parts = raw.split(Regex("(?<=[.!?।\\n])\\s+"))
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+        return if (parts.isEmpty()) listOf(raw) else parts
+    }
+
+    fun selectBestPackForLanguage(
+        catalog: List<NeuralVoicePack>,
+        preferredId: String,
+        persona: AssistantPersona,
+        preferBangla: Boolean,
+        isInstalled: (NeuralVoicePack) -> Boolean
+    ): NeuralVoicePack? {
+        val targetLangPrefix = if (preferBangla) "bn" else "en"
+        val matchingInstalled = catalog.filter {
+            it.languageTag.lowercase().startsWith(targetLangPrefix) && isInstalled(it)
+        }
+        if (matchingInstalled.isEmpty()) return null
+
+        val exactPreferred = matchingInstalled.firstOrNull { it.id == preferredId }
+        if (exactPreferred != null) return exactPreferred
+
+        if (preferBangla) {
+            val femaleFirst = persona == AssistantPersona.ARIA
+            return if (femaleFirst) {
+                matchingInstalled.firstOrNull { it.genderHint.equals("Female", ignoreCase = true) }
+                    ?: matchingInstalled.first()
+            } else {
+                matchingInstalled.firstOrNull { it.id.contains("mimic3", ignoreCase = true) }
+                    ?: matchingInstalled.first()
+            }
+        }
+
+        val personaPreferredIds = when (persona) {
+            AssistantPersona.ARIA -> listOf("en_US-lessac-medium-int8", BUNDLED_STARTER_VOICE_ID)
+            AssistantPersona.AETHER -> listOf(
+                CUSTOM_AETHER_VOICE_ID,
+                "en_US-ryan-medium-int8",
+                BUNDLED_STARTER_VOICE_ID
+            )
+        }
+        for (candidateId in personaPreferredIds) {
+            matchingInstalled.firstOrNull { it.id == candidateId }?.let { return it }
+        }
+        return matchingInstalled.firstOrNull()
+    }
+}
+
 /**
- * Manages on-demand ultra-compact (< 25 MB compressed) Sherpa-ONNX Piper VITS neural voice packs
- * stored in app internal storage and streams synthesized PCM via USAGE_VOICE_COMMUNICATION
- * AudioTrack so hardware AcousticEchoCanceler subtracts speaker output seamlessly.
+ * Manages bundled and on-demand Sherpa-ONNX Piper / VITS neural voice packs stored in app internal
+ * storage and synthesizes PCM audio locally using native OfflineTts + AudioTrack.
+ * Gracefully reports unavailability on unsupported ABIs (e.g. x86_64 emulators) so callers fall back
+ * cleanly to Android System TTS.
  */
 class PiperNeuralVoiceManager(context: Context) {
 
     private val appContext = context.applicationContext
     private val voicesRootDir = File(appContext.filesDir, "voices").apply { mkdirs() }
+    private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val ttsMutex = Mutex()
+    private val extractMutex = Mutex()
 
     private val downloadClient = OkHttpClient.Builder()
         .connectTimeout(20, TimeUnit.SECONDS)
-        .readTimeout(90, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
         .build()
 
+    private var loadedTts: OfflineTts? = null
     private var activePackId: String? = null
-    private var offlineTts: OfflineTts? = null
 
     @Volatile
     private var activeTrack: AudioTrack? = null
@@ -81,7 +176,21 @@ class PiperNeuralVoiceManager(context: Context) {
     @Volatile
     private var stopRequested = false
 
+    @Volatile
+    private var nativeBinaryUnavailable = false
+
     val catalog: List<NeuralVoicePack> = listOf(
+        NeuralVoicePack(
+            id = BUNDLED_STARTER_VOICE_ID,
+            displayName = "Amy Neural · Bundled Offline Starter",
+            languageTag = "en-US",
+            genderHint = "Female",
+            downloadSizeMb = 20.1f,
+            downloadUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-low-int8.tar.bz2",
+            extractedFolderName = "vits-piper-en_US-amy-low-int8",
+            isBundledAsset = true,
+            bundledAssetPath = "voices/vits-piper-en_US-amy-low-int8.tar.bz2"
+        ),
         NeuralVoicePack(
             id = "en_US-lessac-medium-int8",
             displayName = "Lessac Studio (English Female · Medium)",
@@ -101,22 +210,63 @@ class PiperNeuralVoiceManager(context: Context) {
             extractedFolderName = "vits-piper-en_US-ryan-medium-int8"
         ),
         NeuralVoicePack(
-            id = "en_US-amy-low-int8",
-            displayName = "Amy Crisp (English Warm · Lite)",
-            languageTag = "en-US",
+            id = "bn_BD-mimic3-multi_low",
+            displayName = "বাংলা Mimic3 Neural (Bangla · Offline VITS)",
+            languageTag = "bn-BD",
+            genderHint = "Multi-Speaker",
+            downloadSizeMb = 76.2f,
+            downloadUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-mimic3-bn-multi_low.tar.bz2",
+            extractedFolderName = "vits-mimic3-bn-multi_low",
+            defaultSpeakerId = 0
+        ),
+        NeuralVoicePack(
+            id = "bn_BD-coqui-female",
+            displayName = "বাংলা Coqui Studio (Bangla Female · HD)",
+            languageTag = "bn-BD",
             genderHint = "Female",
-            downloadSizeMb = 20.1f,
-            downloadUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-low-int8.tar.bz2",
-            extractedFolderName = "vits-piper-en_US-amy-low-int8"
+            downloadSizeMb = 103.0f,
+            downloadUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-coqui-bn-custom_female.tar.bz2",
+            extractedFolderName = "vits-coqui-bn-custom_female",
+            defaultSpeakerId = 0
+        ),
+        NeuralVoicePack(
+            id = CUSTOM_AETHER_VOICE_ID,
+            displayName = "Custom Aether Neural (.onnx Import)",
+            languageTag = "en-US",
+            genderHint = "Custom",
+            downloadSizeMb = 0f,
+            downloadUrl = "",
+            extractedFolderName = CUSTOM_AETHER_VOICE_ID,
+            defaultSpeakerId = 0
         )
     )
 
     private val _packStates = MutableStateFlow<List<VoicePackUiState>>(emptyList())
     val packStates: StateFlow<List<VoicePackUiState>> = _packStates.asStateFlow()
 
+    private val _engineStatusLabel = MutableStateFlow(detectInitialEngineLabel())
+    val engineStatusLabel: StateFlow<String> = _engineStatusLabel.asStateFlow()
+
     init {
         refreshInstalledStates()
+        backgroundScope.launch {
+            ensureBundledStarterInstalled()
+        }
     }
+
+    private fun detectInitialEngineLabel(): String {
+        val supported = runCatching {
+            Build.SUPPORTED_ABIS.any { it.contains("arm64", ignoreCase = true) }
+        }.getOrDefault(false)
+        return if (supported) {
+            "Piper Native Neural (ARM64 Ready)"
+        } else {
+            "System Fallback (${Build.SUPPORTED_ABIS.firstOrNull() ?: "emulator"})"
+        }
+    }
+
+    fun isNativeRuntimeLikelySupported(): Boolean = !nativeBinaryUnavailable &&
+        Build.SUPPORTED_ABIS.any { it.contains("arm64", ignoreCase = true) }
 
     fun refreshInstalledStates() {
         _packStates.value = catalog.map { pack ->
@@ -129,20 +279,63 @@ class PiperNeuralVoiceManager(context: Context) {
         }
     }
 
+    suspend fun ensureBundledStarterInstalled(): Boolean {
+        val starter = catalog.firstOrNull { it.isBundledAsset && !it.bundledAssetPath.isNullOrBlank() }
+            ?: return false
+        if (isPackInstalled(starter)) return true
+
+        return extractMutex.withLock {
+            if (isPackInstalled(starter)) return@withLock true
+            val assetPath = starter.bundledAssetPath ?: return@withLock false
+            val targetDir = packDir(starter)
+            withContext(Dispatchers.IO) {
+                try {
+                    updatePackState(starter.id) {
+                        it.copy(status = VoicePackStatus.EXTRACTING, progressPercent = 85, errorMessage = null)
+                    }
+                    targetDir.deleteRecursively()
+                    targetDir.mkdirs()
+                    appContext.assets.open(assetPath).use { assetStream ->
+                        extractTarBz2StreamSafely(assetStream, targetDir)
+                    }
+                    val ok = isPackInstalled(starter)
+                    updatePackState(starter.id) {
+                        if (ok) {
+                            it.copy(status = VoicePackStatus.READY, progressPercent = 100, errorMessage = null)
+                        } else {
+                            it.copy(
+                                status = VoicePackStatus.ERROR,
+                                progressPercent = 0,
+                                errorMessage = "Bundled model incomplete"
+                            )
+                        }
+                    }
+                    ok
+                } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
+                    Log.w(TAG, "Bundled starter extraction deferred/failed: ${t.message}")
+                    targetDir.deleteRecursively()
+                    updatePackState(starter.id) {
+                        it.copy(status = VoicePackStatus.NOT_INSTALLED, progressPercent = 0)
+                    }
+                    false
+                }
+            }
+        }
+    }
+
     fun pickBestInstalledPack(
         preferredId: String,
-        persona: AssistantPersona
+        persona: AssistantPersona,
+        preferBangla: Boolean = false
     ): NeuralVoicePack? {
-        val preferred = catalog.firstOrNull { it.id == preferredId && isPackInstalled(it) }
-        if (preferred != null) return preferred
-        val personaPreferredId = when (persona) {
-            AssistantPersona.MAYRA -> "en_US-lessac-medium-int8"
-            AssistantPersona.JARVIS,
-            AssistantPersona.MAX,
-            AssistantPersona.STEALTH -> "en_US-ryan-medium-int8"
-        }
-        return catalog.firstOrNull { it.id == personaPreferredId && isPackInstalled(it) }
-            ?: catalog.firstOrNull { isPackInstalled(it) }
+        return PiperAudioUtils.selectBestPackForLanguage(
+            catalog = catalog,
+            preferredId = preferredId,
+            persona = persona,
+            preferBangla = preferBangla,
+            isInstalled = ::isPackInstalled
+        )
     }
 
     fun isPackInstalled(pack: NeuralVoicePack): Boolean {
@@ -159,12 +352,23 @@ class PiperNeuralVoiceManager(context: Context) {
     private fun findTokensFile(dir: File): File? =
         dir.walkTopDown().firstOrNull { it.isFile && it.name == "tokens.txt" }
 
+    private fun findLexiconFile(dir: File): File? =
+        dir.walkTopDown().firstOrNull { it.isFile && it.name == "lexicon.txt" }
+
     private fun findEspeakDataDir(dir: File): File? =
         dir.walkTopDown().firstOrNull { it.isDirectory && it.name == "espeak-ng-data" }
+
+    private fun findDictDir(dir: File): File? =
+        dir.walkTopDown().firstOrNull { it.isDirectory && it.name == "dict" }
 
     suspend fun downloadAndInstallPack(packId: String): Result<Unit> = withContext(Dispatchers.IO) {
         val pack = catalog.firstOrNull { it.id == packId }
             ?: return@withContext Result.failure(IllegalArgumentException("Unknown voice pack: $packId"))
+
+        if (pack.isBundledAsset && !pack.bundledAssetPath.isNullOrBlank()) {
+            val bundledOk = ensureBundledStarterInstalled()
+            if (bundledOk) return@withContext Result.success(Unit)
+        }
 
         updatePackState(packId) {
             it.copy(status = VoicePackStatus.DOWNLOADING, progressPercent = 0, errorMessage = null)
@@ -211,7 +415,9 @@ class PiperNeuralVoiceManager(context: Context) {
             targetDir.deleteRecursively()
             targetDir.mkdirs()
 
-            extractTarBz2Safely(tempArchive, targetDir)
+            FileInputStream(tempArchive).use { fis ->
+                extractTarBz2StreamSafely(fis, targetDir)
+            }
 
             if (!isPackInstalled(pack)) {
                 throw IllegalStateException("Extracted archive missing ONNX model or tokens.txt")
@@ -239,12 +445,13 @@ class PiperNeuralVoiceManager(context: Context) {
         }
     }
 
-    private fun extractTarBz2Safely(archive: File, destDir: File) {
+    private fun extractTarBz2StreamSafely(rawStream: InputStream, destDir: File) {
         val canonicalDest = destDir.canonicalPath + File.separator
-        BufferedInputStream(FileInputStream(archive)).use { buffered ->
+        BufferedInputStream(rawStream).use { buffered ->
             BZip2CompressorInputStream(buffered).use { bz2 ->
                 TarArchiveInputStream(bz2).use { tar ->
-                    var entry = tar.nextEntry
+                    @Suppress("DEPRECATION")
+                    var entry = tar.nextTarEntry
                     val buf = ByteArray(16 * 1024)
                     while (entry != null) {
                         val outFile = File(destDir, entry.name)
@@ -263,7 +470,8 @@ class PiperNeuralVoiceManager(context: Context) {
                                 }
                             }
                         }
-                        entry = tar.nextEntry
+                        @Suppress("DEPRECATION")
+                        entry = tar.nextTarEntry
                     }
                 }
             }
@@ -273,76 +481,212 @@ class PiperNeuralVoiceManager(context: Context) {
     fun deletePack(packId: String) {
         val pack = catalog.firstOrNull { it.id == packId } ?: return
         if (activePackId == packId) {
-            runCatching { offlineTts?.release() }
-            offlineTts = null
+            runCatching { loadedTts?.release() }
+            loadedTts = null
             activePackId = null
         }
         packDir(pack).deleteRecursively()
         refreshInstalledStates()
     }
 
-    private fun ensureEngineLoaded(pack: NeuralVoicePack): OfflineTts? {
-        if (Build.FINGERPRINT.equals("robolectric", ignoreCase = true)) {
-            return null
-        }
-        if (activePackId == pack.id && offlineTts != null) {
-            return offlineTts
-        }
-        val dir = packDir(pack)
-        val modelFile = findOnnxFile(dir) ?: return null
-        val tokensFile = findTokensFile(dir) ?: return null
-        val dataDir = findEspeakDataDir(dir)?.absolutePath.orEmpty()
+    suspend fun importCustomOnnxFromUri(uri: Uri): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            val pack = catalog.first { it.id == CUSTOM_AETHER_VOICE_ID }
+            val name = VoiceSampleAnalyzer.resolveDisplayName(appContext, uri) ?: "custom_voice"
+            val lowerName = name.lowercase()
+            val targetDir = File(voicesRootDir, pack.id)
+            targetDir.mkdirs()
 
-        return runCatching {
-            offlineTts?.release()
-            val vitsConfig = OfflineTtsVitsModelConfig(
-                model = modelFile.absolutePath,
-                lexicon = "",
-                tokens = tokensFile.absolutePath,
-                dataDir = dataDir,
-                dictDir = "",
-                noiseScale = 0.667f,
-                noiseScaleW = 0.8f,
-                lengthScale = 1.0f
-            )
-            val modelConfig = OfflineTtsModelConfig(
-                vits = vitsConfig,
-                numThreads = 2,
-                debug = false,
-                provider = "cpu"
-            )
-            val ttsConfig = OfflineTtsConfig(
-                model = modelConfig,
-                ruleFsts = "",
-                ruleFars = "",
-                maxNumSentences = 1,
-                silenceScale = 0.22f
-            )
-            OfflineTts(assetManager = null, config = ttsConfig).also {
-                offlineTts = it
-                activePackId = pack.id
-                Log.i(TAG, "Initialized Piper OfflineTts '${pack.id}' @ ${it.sampleRate()} Hz")
+            if (lowerName.endsWith(".tar.bz2") || lowerName.endsWith(".tbz2")) {
+                targetDir.deleteRecursively()
+                targetDir.mkdirs()
+                appContext.contentResolver.openInputStream(uri)?.use { input ->
+                    extractTarBz2StreamSafely(input, targetDir)
+                } ?: throw IllegalStateException("Cannot read selected voice archive.")
+                if (!isPackInstalled(pack)) {
+                    targetDir.deleteRecursively()
+                    throw IllegalStateException("Archive must contain a Piper .onnx model and tokens.txt")
+                }
+            } else if (lowerName.endsWith(".onnx")) {
+                val outOnnx = File(targetDir, "model.onnx")
+                appContext.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(outOnnx).use { output -> input.copyTo(output) }
+                } ?: throw IllegalStateException("Cannot read .onnx model file.")
+                // Copy starter tokens.txt as fallback vocabulary if user didn't bundle one yet
+                if (findTokensFile(targetDir) == null) {
+                    val starterPack = catalog.firstOrNull { it.id == BUNDLED_STARTER_VOICE_ID }
+                    val starterTokens = starterPack?.let { findTokensFile(packDir(it)) }
+                    if (starterTokens != null) {
+                        starterTokens.copyTo(File(targetDir, "tokens.txt"), overwrite = true)
+                    } else {
+                        throw IllegalStateException("Please import a Piper .tar.bz2 pack containing tokens.txt")
+                    }
+                }
+            } else if (lowerName == "tokens.txt") {
+                val outTokens = File(targetDir, "tokens.txt")
+                appContext.contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(outTokens).use { output -> input.copyTo(output) }
+                } ?: throw IllegalStateException("Cannot read tokens.txt")
+            } else {
+                throw IllegalStateException("Select a Piper .tar.bz2 voice pack or .onnx model file.")
             }
-        }.onFailure { err ->
-            Log.e(TAG, "Failed initializing Sherpa-ONNX OfflineTts", err)
-        }.getOrNull()
+
+            if (activePackId == pack.id) {
+                runCatching { loadedTts?.release() }
+                loadedTts = null
+                activePackId = null
+            }
+            refreshInstalledStates()
+            if (isPackInstalled(pack)) {
+                "Custom Neural Model Ready ($name)"
+            } else {
+                "Imported $name — now select the paired tokens.txt or .onnx file"
+            }
+        }
     }
 
     suspend fun speakWithPack(
         text: String,
         pack: NeuralVoicePack,
         speed: Float,
+        pitchFactor: Float = 1.0f,
         audioAttributes: AudioAttributes,
         onAmplitude: (Float) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
-        val engine = ensureEngineLoaded(pack) ?: return@withContext false
+        if (nativeBinaryUnavailable) return@withContext false
+
+        if (!isPackInstalled(pack) && pack.isBundledAsset) {
+            ensureBundledStarterInstalled()
+        }
+        val dir = packDir(pack)
+        val modelFile = findOnnxFile(dir) ?: return@withContext false
+        val tokensFile = findTokensFile(dir) ?: return@withContext false
+        val lexiconFile = findLexiconFile(dir)
+        val espeakDir = findEspeakDataDir(dir)
+        val dictDir = findDictDir(dir)
+
         stopRequested = false
-        val sampleRate = engine.sampleRate().coerceIn(8000, 48000)
+
+        try {
+            val engine = ttsMutex.withLock {
+                if (activePackId != pack.id || loadedTts == null) {
+                    runCatching { loadedTts?.release() }
+                    loadedTts = null
+                    activePackId = null
+
+                    val vitsConfig = OfflineTtsVitsModelConfig(
+                        model = modelFile.absolutePath,
+                        lexicon = lexiconFile?.absolutePath.orEmpty(),
+                        tokens = tokensFile.absolutePath,
+                        dataDir = espeakDir?.absolutePath.orEmpty(),
+                        dictDir = dictDir?.absolutePath.orEmpty()
+                    )
+                    val adaptiveThreads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+                    val modelConfig = OfflineTtsModelConfig(
+                        vits = vitsConfig,
+                        numThreads = adaptiveThreads,
+                        debug = false,
+                        provider = "cpu"
+                    )
+                    val config = OfflineTtsConfig(
+                        model = modelConfig,
+                        ruleFsts = "",
+                        ruleFars = "",
+                        maxNumSentences = 1,
+                        silenceScale = 0.16f
+                    )
+                    loadedTts = OfflineTts(assetManager = null, config = config)
+                    activePackId = pack.id
+                    _engineStatusLabel.value = "Piper Fast ($adaptiveThreads-Thread) · ${pack.displayName.substringBefore('·').trim()}"
+                }
+                loadedTts
+            } ?: return@withContext false
+
+            if (stopRequested) return@withContext false
+
+            val sentences = PiperAudioUtils.splitSentencesForPipeline(text)
+            if (sentences.isEmpty()) return@withContext false
+
+            val effectiveSpeed = speed.coerceIn(0.75f, 1.45f)
+            val effectivePitch = pitchFactor.coerceIn(0.78f, 1.25f)
+
+            // Generate sentence 1 immediately for ultra-low latency first-audio, then overlap remaining sentences
+            val firstGen = ttsMutex.withLock {
+                engine.generate(
+                    text = sentences.first(),
+                    sid = pack.defaultSpeakerId,
+                    speed = effectiveSpeed
+                )
+            }
+            if (stopRequested || firstGen.samples.isEmpty()) {
+                onAmplitude(0f)
+                return@withContext false
+            }
+
+            val sampleRate = firstGen.sampleRate.coerceIn(8000, 48000)
+            val audioChannel = Channel<FloatArray>(capacity = 2)
+
+            coroutineScope {
+                val producer = launch(Dispatchers.IO) {
+                    try {
+                        audioChannel.send(firstGen.samples)
+                        for (i in 1 until sentences.size) {
+                            if (stopRequested) break
+                            val nextGen = ttsMutex.withLock {
+                                if (stopRequested) null else engine.generate(
+                                    text = sentences[i],
+                                    sid = pack.defaultSpeakerId,
+                                    speed = effectiveSpeed
+                                )
+                            } ?: break
+                            if (!stopRequested && nextGen.samples.isNotEmpty()) {
+                                audioChannel.send(nextGen.samples)
+                            }
+                        }
+                    } finally {
+                        audioChannel.close()
+                    }
+                }
+
+                streamPcmChannel(
+                    sampleRate = sampleRate,
+                    pitchFactor = effectivePitch,
+                    audioAttributes = audioAttributes,
+                    channel = audioChannel,
+                    onAmplitude = onAmplitude
+                )
+                producer.join()
+            }
+            true
+        } catch (ule: UnsatisfiedLinkError) {
+            nativeBinaryUnavailable = true
+            _engineStatusLabel.value = "System Fallback (ABI unavailable)"
+            Log.w(TAG, "Sherpa-ONNX native library unavailable on this ABI; falling back to System TTS", ule)
+            onAmplitude(0f)
+            false
+        } catch (ce: CancellationException) {
+            stopPlayback()
+            onAmplitude(0f)
+            throw ce
+        } catch (t: Throwable) {
+            Log.e(TAG, "Piper neural synthesis failed for '${pack.id}', falling back to System TTS", t)
+            onAmplitude(0f)
+            false
+        }
+    }
+
+    private suspend fun streamPcmChannel(
+        sampleRate: Int,
+        pitchFactor: Float,
+        audioAttributes: AudioAttributes,
+        channel: Channel<FloatArray>,
+        onAmplitude: (Float) -> Unit
+    ) {
         val minBuf = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT
-        ).coerceAtLeast(2048)
+        ).coerceAtLeast(4096)
 
         val track = AudioTrack.Builder()
             .setAudioAttributes(audioAttributes)
@@ -353,58 +697,57 @@ class PiperNeuralVoiceManager(context: Context) {
                     .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
                     .build()
             )
-            .setBufferSizeInBytes(minBuf * 2)
             .setTransferMode(AudioTrack.MODE_STREAM)
+            .setBufferSizeInBytes(minBuf * 2)
             .build()
 
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && kotlin.math.abs(pitchFactor - 1.0f) > 0.02f) {
+            runCatching {
+                track.playbackParams = PlaybackParams().apply {
+                    pitch = pitchFactor.coerceIn(0.78f, 1.25f)
+                    speed = 1.0f
+                }
+            }
+        }
+
         activeTrack = track
+        val chunkSamples = (sampleRate / 25).coerceIn(512, 2048)
+        val pcmBytes = ByteArray(chunkSamples * 2)
+
         try {
             track.play()
-            engine.generateWithCallback(
-                text = text,
-                sid = pack.defaultSpeakerId,
-                speed = speed.coerceIn(0.75f, 1.35f)
-            ) { floatSamples ->
-                if (stopRequested) {
-                    return@generateWithCallback 0
+            for (samples in channel) {
+                if (stopRequested) break
+                var offset = 0
+                while (offset < samples.size && !stopRequested) {
+                    val count = min(chunkSamples, samples.size - offset)
+                    val amp = PiperAudioUtils.floatFrameToPcm16(
+                        samples = samples,
+                        offset = offset,
+                        length = count,
+                        outBytes = pcmBytes
+                    )
+                    onAmplitude(amp)
+                    val written = track.write(pcmBytes, 0, count * 2)
+                    if (written < 0) break
+                    offset += count
                 }
-                if (floatSamples.isNotEmpty()) {
-                    val pcm = ShortArray(floatSamples.size)
-                    var sumSq = 0.0
-                    for (i in floatSamples.indices) {
-                        val clamped = floatSamples[i].coerceIn(-1f, 1f)
-                        val s = (clamped * 32767f).toInt().toShort()
-                        pcm[i] = s
-                        sumSq += clamped * clamped
-                    }
-                    val rms = sqrt(sumSq / floatSamples.size).toFloat()
-                    onAmplitude((rms * 2.6f).coerceIn(0.08f, 0.96f))
-                    val written = runCatching {
-                        track.write(pcm, 0, pcm.size)
-                    }.getOrDefault(-1)
-                    if (written < 0 || stopRequested) {
-                        return@generateWithCallback 0
-                    }
-                }
-                1
             }
             if (!stopRequested) {
-                runCatching {
-                    track.stop()
-                }
+                val remainingMs = ((minBuf.toFloat() / (sampleRate * 2)) * 1000f).toLong().coerceIn(80L, 240L)
+                kotlinx.coroutines.delay(remainingMs)
             }
-            !stopRequested
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (e: Exception) {
-            Log.e(TAG, "Piper playback failed", e)
-            false
         } finally {
             onAmplitude(0f)
-            runCatching { track.release() }
             if (activeTrack === track) {
                 activeTrack = null
             }
+            runCatching {
+                track.pause()
+                track.flush()
+                track.stop()
+            }
+            runCatching { track.release() }
         }
     }
 
@@ -419,8 +762,8 @@ class PiperNeuralVoiceManager(context: Context) {
 
     fun release() {
         stopPlayback()
-        runCatching { offlineTts?.release() }
-        offlineTts = null
+        runCatching { loadedTts?.release() }
+        loadedTts = null
         activePackId = null
     }
 

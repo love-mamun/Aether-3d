@@ -137,6 +137,7 @@ class TaskDagExecutor {
             return DagExecutionSummary(emptyList(), 0, 0, 0, 0)
         }
 
+        val stateLock = Any()
         val statusMap = nodes.associate { it.id to TaskStatus.QUEUED }.toMutableMap()
         val toolOutputs = mutableListOf<String>()
         var completed = 0
@@ -144,20 +145,28 @@ class TaskDagExecutor {
         var timedOutCount = 0
         var skipped = 0
 
-        while (statusMap.values.any { it == TaskStatus.QUEUED }) {
+        while (synchronized(stateLock) { statusMap.values.any { it == TaskStatus.QUEUED } }) {
             // 1. Cascade SKIPPED for any node whose dependency failed/timed out/skipped
             var skippedAny = true
             while (skippedAny) {
                 skippedAny = false
                 for (node in nodes) {
-                    if (statusMap[node.id] != TaskStatus.QUEUED) continue
-                    val blockedDep = node.dependencies.firstOrNull { dep ->
-                        val st = statusMap[dep]
-                        st == TaskStatus.FAILED || st == TaskStatus.TIMED_OUT || st == TaskStatus.SKIPPED
+                    val blockedDep = synchronized(stateLock) {
+                        if (statusMap[node.id] != TaskStatus.QUEUED) {
+                            null
+                        } else {
+                            val depHit = node.dependencies.firstOrNull { dep ->
+                                val st = statusMap[dep]
+                                st == TaskStatus.FAILED || st == TaskStatus.TIMED_OUT || st == TaskStatus.SKIPPED
+                            }
+                            if (depHit != null) {
+                                statusMap[node.id] = TaskStatus.SKIPPED
+                                skipped++
+                            }
+                            depHit
+                        }
                     }
                     if (blockedDep != null) {
-                        statusMap[node.id] = TaskStatus.SKIPPED
-                        skipped++
                         onTaskUpdate(node.id, TaskStatus.SKIPPED, "Skipped ($blockedDep failed)", 0L, false)
                         skippedAny = true
                     }
@@ -165,19 +174,24 @@ class TaskDagExecutor {
             }
 
             // 2. Gather ready wave (all dependencies DONE)
-            val readyWave = nodes.filter { node ->
-                statusMap[node.id] == TaskStatus.QUEUED &&
-                    node.dependencies.all { dep -> statusMap[dep] == TaskStatus.DONE }
+            val readyWave = synchronized(stateLock) {
+                nodes.filter { node ->
+                    statusMap[node.id] == TaskStatus.QUEUED &&
+                        node.dependencies.all { dep -> statusMap[dep] == TaskStatus.DONE }
+                }
             }
 
             if (readyWave.isEmpty()) {
-                // Defensive break against unexpected graph state
-                for (node in nodes) {
-                    if (statusMap[node.id] == TaskStatus.QUEUED) {
-                        statusMap[node.id] = TaskStatus.SKIPPED
-                        skipped++
-                        onTaskUpdate(node.id, TaskStatus.SKIPPED, "Skipped (unresolved dep)", 0L, false)
+                val leftover = synchronized(stateLock) {
+                    nodes.filter { statusMap[it.id] == TaskStatus.QUEUED }.also { rem ->
+                        rem.forEach { n ->
+                            statusMap[n.id] = TaskStatus.SKIPPED
+                            skipped++
+                        }
                     }
+                }
+                for (node in leftover) {
+                    onTaskUpdate(node.id, TaskStatus.SKIPPED, "Skipped (unresolved dep)", 0L, false)
                 }
                 break
             }
@@ -188,8 +202,10 @@ class TaskDagExecutor {
                         if (node.step.actionType == ActionType.SPEAK_ONLY ||
                             node.step.actionType == ActionType.SCREEN_EXPLAIN
                         ) {
-                            statusMap[node.id] = TaskStatus.DONE
-                            completed++
+                            synchronized(stateLock) {
+                                statusMap[node.id] = TaskStatus.DONE
+                                completed++
+                            }
                             onTaskUpdate(node.id, TaskStatus.DONE, "Prepared", 0L, false)
                             return@async
                         }
@@ -205,7 +221,9 @@ class TaskDagExecutor {
                             delay(1_150L)
                         }
 
-                        statusMap[node.id] = TaskStatus.RUNNING
+                        synchronized(stateLock) {
+                            statusMap[node.id] = TaskStatus.RUNNING
+                        }
                         val timeoutSec = (node.timeoutMs / 1000L).coerceAtLeast(1L)
                         onTaskUpdate(node.id, TaskStatus.RUNNING, "Running (${timeoutSec}s cap)...", 0L, false)
                         val startMs = System.currentTimeMillis()
@@ -220,22 +238,29 @@ class TaskDagExecutor {
                             if (result.torchStateChanged != null) {
                                 onTorchStateChanged(result.torchStateChanged)
                             }
-                            result.toolOutputForSummary?.let { out ->
-                                synchronized(toolOutputs) { toolOutputs.add(out) }
+                            synchronized(stateLock) {
+                                result.toolOutputForSummary?.let { out -> toolOutputs.add(out) }
+                                if (result.success) {
+                                    statusMap[node.id] = TaskStatus.DONE
+                                    completed++
+                                } else {
+                                    statusMap[node.id] = TaskStatus.FAILED
+                                    failed++
+                                }
                             }
-                            if (result.success) {
-                                statusMap[node.id] = TaskStatus.DONE
-                                completed++
-                                onTaskUpdate(node.id, TaskStatus.DONE, result.detail, elapsed, false)
-                            } else {
-                                statusMap[node.id] = TaskStatus.FAILED
-                                failed++
-                                onTaskUpdate(node.id, TaskStatus.FAILED, result.detail, elapsed, false)
-                            }
+                            onTaskUpdate(
+                                node.id,
+                                if (result.success) TaskStatus.DONE else TaskStatus.FAILED,
+                                result.detail,
+                                elapsed,
+                                false
+                            )
                         } catch (_: TimeoutCancellationException) {
                             val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(node.timeoutMs)
-                            statusMap[node.id] = TaskStatus.TIMED_OUT
-                            timedOutCount++
+                            synchronized(stateLock) {
+                                statusMap[node.id] = TaskStatus.TIMED_OUT
+                                timedOutCount++
+                            }
                             onTaskUpdate(
                                 node.id,
                                 TaskStatus.TIMED_OUT,
@@ -247,8 +272,10 @@ class TaskDagExecutor {
                             throw ce
                         } catch (e: Exception) {
                             val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
-                            statusMap[node.id] = TaskStatus.FAILED
-                            failed++
+                            synchronized(stateLock) {
+                                statusMap[node.id] = TaskStatus.FAILED
+                                failed++
+                            }
                             onTaskUpdate(
                                 node.id,
                                 TaskStatus.FAILED,
@@ -262,13 +289,15 @@ class TaskDagExecutor {
             }
         }
 
-        return DagExecutionSummary(
-            toolOutputs = toolOutputs.toList(),
-            completedCount = completed,
-            failedCount = failed,
-            timedOutCount = timedOutCount,
-            skippedCount = skipped
-        )
+        return synchronized(stateLock) {
+            DagExecutionSummary(
+                toolOutputs = toolOutputs.toList(),
+                completedCount = completed,
+                failedCount = failed,
+                timedOutCount = timedOutCount,
+                skippedCount = skipped
+            )
+        }
     }
 
     internal fun resolveTimeoutMs(step: PlannedStep): Long {
@@ -277,13 +306,15 @@ class TaskDagExecutor {
             ActionType.WEATHER_LOOKUP,
             ActionType.WIKIPEDIA_LOOKUP,
             ActionType.CURRENCY_CONVERT,
-            ActionType.WEB_SEARCH -> 12_000L
+            ActionType.WEB_SEARCH -> 16_000L
 
             ActionType.LAUNCH_APP,
             ActionType.SEARCH_IN_APP,
             ActionType.OPEN_SETTINGS,
             ActionType.PLAY_MEDIA,
             ActionType.NAVIGATE_MAPS -> 9_000L
+
+            ActionType.SEND_APP_MESSAGE -> 45_000L
 
             ActionType.UI_TAP_TEXT,
             ActionType.UI_TAP_COORDINATES,
@@ -302,6 +333,7 @@ class TaskDagExecutor {
             ActionType.OPEN_SETTINGS,
             ActionType.DIAL_CONTACT,
             ActionType.SEND_MESSAGE,
+            ActionType.SEND_APP_MESSAGE,
             ActionType.DRAFT_EMAIL,
             ActionType.NAVIGATE_MAPS,
             ActionType.PLAY_MEDIA,

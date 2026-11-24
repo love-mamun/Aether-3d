@@ -68,10 +68,8 @@ class FullDuplexLiveManager(
                 onStateChanged(true, "Gemini Live · Connecting...")
 
                 val voiceName = when (persona) {
-                    AssistantPersona.MAYRA -> "Aoede"
-                    AssistantPersona.MAX -> "Fenrir"
-                    AssistantPersona.STEALTH -> "Charon"
-                    AssistantPersona.JARVIS -> "Puck"
+                    AssistantPersona.ARIA -> "Aoede"
+                    AssistantPersona.AETHER -> "Puck"
                 }
 
                 val runActionTool = FunctionDeclaration(

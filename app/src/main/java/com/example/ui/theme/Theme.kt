@@ -8,14 +8,12 @@ import com.example.ai.AssistantPersona
 
 @Composable
 fun Aether3DTheme(
-    persona: AssistantPersona = AssistantPersona.JARVIS,
+    persona: AssistantPersona = AssistantPersona.AETHER,
     content: @Composable () -> Unit
 ) {
     val accentColor = when (persona) {
-        AssistantPersona.JARVIS -> ArcCyan
-        AssistantPersona.MAX -> SolarGold
-        AssistantPersona.MAYRA -> NeuralViolet
-        AssistantPersona.STEALTH -> StealthEmerald
+        AssistantPersona.AETHER -> ArcCyan
+        AssistantPersona.ARIA -> NeuralViolet
     }
 
     val colorScheme = darkColorScheme(

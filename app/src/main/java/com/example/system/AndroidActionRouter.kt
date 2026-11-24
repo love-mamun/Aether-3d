@@ -1,6 +1,7 @@
 package com.example.system
 
 import android.Manifest
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -8,6 +9,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioManager
 import android.net.Uri
+import android.os.Build
 import android.os.SystemClock
 import android.provider.AlarmClock
 import android.provider.CalendarContract
@@ -49,13 +51,26 @@ class AndroidActionRouter(
                 ActionExecutionResult(true, "Response ready")
 
             ActionType.WEATHER_LOOKUP -> {
-                val coords = telemetryProvider.getLastCoarseCoordinates()
+                val coords = telemetryProvider.getFreshOrLastCoordinates()
+                val cityLabel = if (coords != null) {
+                    telemetryProvider.reverseGeocodeCityNameFast(coords.first, coords.second)
+                } else null
+                val preferBangla = step.textPayload.equals("bn", ignoreCase = true) ||
+                    step.label.any { it in '\u0980'..'\u09FF' } ||
+                    step.target.any { it in '\u0980'..'\u09FF' }
                 val weather = webTools.fetchWeather(
                     cityQuery = step.target,
                     fallbackLat = coords?.first,
-                    fallbackLon = coords?.second
+                    fallbackLon = coords?.second,
+                    fallbackCityName = cityLabel,
+                    preferBangla = preferBangla
                 )
-                ActionExecutionResult(true, weather, toolOutputForSummary = weather)
+                val failed = webTools.isWeatherErrorText(weather)
+                ActionExecutionResult(
+                    success = !failed,
+                    detail = weather,
+                    toolOutputForSummary = weather
+                )
             }
 
             ActionType.WIKIPEDIA_LOOKUP -> {
@@ -94,6 +109,12 @@ class AndroidActionRouter(
 
             ActionType.TOGGLE_TORCH -> toggleTorch(step.boolValue)
 
+            ActionType.TOGGLE_DND -> toggleDnd(step.boolValue)
+
+            ActionType.TOGGLE_WIFI -> toggleWifi(step.boolValue)
+
+            ActionType.TOGGLE_BLUETOOTH -> toggleBluetooth()
+
             ActionType.ADJUST_VOLUME -> adjustVolume(step.intValue, step.target)
 
             ActionType.CONTROL_MEDIA -> controlMedia(step.target)
@@ -110,6 +131,8 @@ class AndroidActionRouter(
                 splitScreenEnabled = splitScreenEnabled
             )
 
+            ActionType.POST_SOCIAL -> launchApp(step.target.ifBlank { "Facebook" }, splitScreenEnabled)
+
             ActionType.SET_ALARM -> setAlarm(step.intValue, step.secondaryIntValue, step.textPayload)
 
             ActionType.SET_TIMER -> setTimer(step.intValue, step.textPayload)
@@ -120,11 +143,23 @@ class AndroidActionRouter(
 
             ActionType.SEND_MESSAGE -> sendMessage(step.target, step.textPayload)
 
+            ActionType.SEND_APP_MESSAGE -> {
+                val parsed = com.example.accessibility.MessagingUiHeuristics.parseAppAndRecipient(
+                    target = step.target,
+                    explicitRecipient = step.recipient
+                )
+                sendMessage("${parsed.appName} ${parsed.recipientName}".trim(), step.textPayload)
+            }
+
             ActionType.DRAFT_EMAIL -> draftEmail(step.target, step.textPayload)
 
             ActionType.NAVIGATE_MAPS -> navigateMaps(step.target.ifBlank { step.textPayload })
 
-            ActionType.PLAY_MEDIA -> playMedia(step.target.ifBlank { step.textPayload }, splitScreenEnabled)
+            ActionType.PLAY_MEDIA -> playMedia(
+                query = step.textPayload.ifBlank { step.target },
+                appHint = step.target,
+                splitScreenEnabled = splitScreenEnabled
+            )
 
             ActionType.WEB_SEARCH -> webSearch(step.target.ifBlank { step.textPayload })
 
@@ -185,6 +220,40 @@ class AndroidActionRouter(
         } catch (e: Exception) {
             ActionExecutionResult(false, "Flashlight error: ${e.localizedMessage ?: "unavailable"}")
         }
+    }
+
+    private fun toggleDnd(enable: Boolean): ActionExecutionResult {
+        return try {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (!nm.isNotificationPolicyAccessGranted) {
+                val intent = Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)
+                startActivitySafe(intent, false, "Grant Do Not Disturb access for offline DND control")
+                return ActionExecutionResult(false, "Grant Do Not Disturb access in the opened Settings page")
+            }
+            val filter = if (enable) {
+                NotificationManager.INTERRUPTION_FILTER_PRIORITY
+            } else {
+                NotificationManager.INTERRUPTION_FILTER_ALL
+            }
+            nm.setInterruptionFilter(filter)
+            ActionExecutionResult(true, if (enable) "Do Not Disturb ON" else "Do Not Disturb OFF")
+        } catch (e: Exception) {
+            ActionExecutionResult(false, "DND error: ${e.localizedMessage ?: "unavailable"}")
+        }
+    }
+
+    private fun toggleWifi(enable: Boolean): ActionExecutionResult {
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            Intent(Settings.Panel.ACTION_INTERNET_CONNECTIVITY)
+        } else {
+            Intent(Settings.ACTION_WIFI_SETTINGS)
+        }
+        val label = if (enable) "Opened Wi-Fi connectivity panel" else "Opened Wi-Fi panel to turn OFF"
+        return startActivitySafe(intent, false, label)
+    }
+
+    private fun toggleBluetooth(): ActionExecutionResult {
+        return startActivitySafe(Intent(Settings.ACTION_BLUETOOTH_SETTINGS), false, "Opened Bluetooth Settings")
     }
 
     private fun adjustVolume(percent: Int, target: String): ActionExecutionResult {
@@ -269,27 +338,27 @@ class AndroidActionRouter(
         }
     }
 
+    fun launchAppByName(appName: String, splitScreenEnabled: Boolean): ActionExecutionResult =
+        launchApp(appName, splitScreenEnabled)
+
     private fun launchApp(appName: String, splitScreenEnabled: Boolean): ActionExecutionResult {
         val clean = appName.trim()
         if (clean.equals("camera", ignoreCase = true)) {
             return startActivitySafe(Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA), splitScreenEnabled, "Opened Camera")
         }
-        val appMap = telemetryProvider.queryLauncherAppMap()
-        val match = appMap.entries.firstOrNull { it.key.equals(clean, ignoreCase = true) }
-            ?: appMap.entries.firstOrNull { it.key.contains(clean, ignoreCase = true) }
-            ?: appMap.entries.firstOrNull { clean.contains(it.key, ignoreCase = true) }
-
+        val match = telemetryProvider.findBestAppMatch(clean)
         if (match != null) {
-            val launchIntent = context.packageManager.getLaunchIntentForPackage(match.value)
+            val (label, pkg) = match
+            val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
             if (launchIntent != null) {
-                return startActivitySafe(launchIntent, splitScreenEnabled, "Launched ${match.key}")
+                return startActivitySafe(launchIntent, splitScreenEnabled, "Launched $label")
             }
         }
 
         return when {
             clean.contains("setting", ignoreCase = true) -> openSettings("")
-            clean.contains("phone", ignoreCase = true) || clean.contains("dialer", ignoreCase = true) ->
-                startActivitySafe(Intent(Intent.ACTION_DIAL), splitScreenEnabled, "Opened Dialer")
+            clean.contains("phone", ignoreCase = true) || clean.contains("dial", ignoreCase = true) ->
+                startActivitySafe(Intent(Intent.ACTION_DIAL), splitScreenEnabled, "Opened Phone Dialer")
             clean.contains("clock", ignoreCase = true) || clean.contains("alarm", ignoreCase = true) ->
                 startActivitySafe(Intent(AlarmClock.ACTION_SHOW_ALARMS), splitScreenEnabled, "Opened Clock")
             clean.contains("browser", ignoreCase = true) || clean.contains("chrome", ignoreCase = true) ->
@@ -337,7 +406,24 @@ class AndroidActionRouter(
     private suspend fun dialContact(target: String): ActionExecutionResult {
         val phone = resolvePhoneNumber(target)
         val uri = if (phone != null) Uri.parse("tel:$phone") else Uri.parse("tel:")
-        return startActivitySafe(Intent(Intent.ACTION_DIAL, uri), false, "Dialer ready for ${phone ?: target}")
+        val hasCallPhone = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.CALL_PHONE
+        ) == PackageManager.PERMISSION_GRANTED
+
+        if (phone != null && hasCallPhone) {
+            return startActivitySafe(
+                Intent(Intent.ACTION_CALL, uri),
+                false,
+                "Calling ${target.ifBlank { phone }} directly"
+            )
+        }
+        val res = startActivitySafe(
+            Intent(Intent.ACTION_DIAL, uri),
+            false,
+            if (phone != null) "Opened dialer for $phone (grant Call permission for 1-tap auto-call)" else "Opened Phone Dialer for $target"
+        )
+        return res
     }
 
     private suspend fun sendMessage(target: String, body: String): ActionExecutionResult {
@@ -459,15 +545,23 @@ class AndroidActionRouter(
         }
     }
 
-    private fun playMedia(query: String, splitScreenEnabled: Boolean): ActionExecutionResult {
-        val clean = query.trim()
+    private fun playMedia(
+        query: String,
+        appHint: String = "",
+        splitScreenEnabled: Boolean
+    ): ActionExecutionResult {
+        val clean = query.trim().ifBlank { appHint.trim() }
         val encoded = URLEncoder.encode(clean, "UTF-8")
-        // Prefer direct YouTube app search when video/YouTube is available
+        val wantsYouTube = appHint.contains("youtube", ignoreCase = true) ||
+            clean.contains("youtube", ignoreCase = true) ||
+            appHint.isBlank()
+
         val ytUrlIntent = Intent(
             Intent.ACTION_VIEW,
             Uri.parse("https://www.youtube.com/results?search_query=$encoded")
         ).apply { setPackage("com.google.android.youtube") }
-        if (clean.contains("youtube", ignoreCase = true) && ytUrlIntent.resolveActivity(context.packageManager) != null) {
+
+        if (wantsYouTube && ytUrlIntent.resolveActivity(context.packageManager) != null) {
             return startActivitySafe(ytUrlIntent, splitScreenEnabled, "Opened YouTube search: $clean")
         }
         val mediaIntent = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH).apply {

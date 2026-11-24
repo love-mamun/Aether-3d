@@ -8,9 +8,7 @@ import android.content.pm.PackageManager
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
-import android.media.audiofx.AcousticEchoCanceler
-import android.media.audiofx.AutomaticGainControl
-import android.media.audiofx.NoiseSuppressor
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -24,6 +22,7 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.ai.AssistantPersona
 import com.example.ai.SpeechLocaleOption
+import com.example.audio.HardwareAudioEffectController
 import com.example.voice.PiperNeuralVoiceManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -71,7 +70,113 @@ internal object EchoGuardPolicy {
             AudioOutputRoute.LOUDSPEAKER -> max(3600.0, baselineRms * 2.2) to 6
         }
     }
+
+    enum class StandbyDecision {
+        START_WAKE_WORD,
+        BUTTON_ONLY_IDLE,
+        PAUSED_BY_USER,
+        PAUSED_FOR_MUSIC,
+        YIELDS_TO_FILTERED_MIC,
+        BUSY_NOT_IDLE,
+        DISABLED_OR_NO_PERMISSION
+    }
+
+    fun resolveBackgroundStandby(
+        wakeWordEnabled: Boolean,
+        micGranted: Boolean,
+        backgroundServicePaused: Boolean,
+        filteredMicCapturing: Boolean,
+        pauseWakeDuringMusic: Boolean,
+        musicPlaybackActive: Boolean,
+        isCoreIdle: Boolean,
+        wakeTriggerMode: com.example.data.local.WakeTriggerMode =
+            com.example.data.local.WakeTriggerMode.HYBRID_KWS_AND_BUTTON
+    ): StandbyDecision {
+        if (wakeTriggerMode == com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY) {
+            return StandbyDecision.BUTTON_ONLY_IDLE
+        }
+        if (backgroundServicePaused) return StandbyDecision.PAUSED_BY_USER
+        if (filteredMicCapturing) return StandbyDecision.YIELDS_TO_FILTERED_MIC
+        if (!wakeWordEnabled || !micGranted) return StandbyDecision.DISABLED_OR_NO_PERMISSION
+        if (pauseWakeDuringMusic && musicPlaybackActive) return StandbyDecision.PAUSED_FOR_MUSIC
+        if (!isCoreIdle) return StandbyDecision.BUSY_NOT_IDLE
+        return StandbyDecision.START_WAKE_WORD
+    }
 }
+
+internal data class SpeechErrorClassification(
+    val userMessage: String,
+    val isServiceOrDeviceFailure: Boolean,
+    val shouldRetryBusy: Boolean = false
+)
+
+internal object SpeechErrorPolicy {
+    fun classifyError(errorCode: Int): SpeechErrorClassification {
+        return when (errorCode) {
+            SpeechRecognizer.ERROR_AUDIO -> SpeechErrorClassification(
+                userMessage = "Audio recording error.",
+                isServiceOrDeviceFailure = true
+            )
+            SpeechRecognizer.ERROR_CLIENT -> SpeechErrorClassification(
+                userMessage = "Voice recognizer unavailable.",
+                isServiceOrDeviceFailure = true
+            )
+            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> SpeechErrorClassification(
+                userMessage = "Microphone permission required.",
+                isServiceOrDeviceFailure = false
+            )
+            SpeechRecognizer.ERROR_NETWORK,
+            SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> SpeechErrorClassification(
+                userMessage = "Network unavailable for speech recognition.",
+                isServiceOrDeviceFailure = true
+            )
+            SpeechRecognizer.ERROR_NO_MATCH -> SpeechErrorClassification(
+                userMessage = "Didn't catch any speech. Tap mic or type below.",
+                isServiceOrDeviceFailure = false
+            )
+            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> SpeechErrorClassification(
+                userMessage = "No speech detected. Tap mic or type below.",
+                isServiceOrDeviceFailure = false
+            )
+            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> SpeechErrorClassification(
+                userMessage = "Speech recognizer busy, please retry.",
+                isServiceOrDeviceFailure = true,
+                shouldRetryBusy = true
+            )
+            SpeechRecognizer.ERROR_SERVER -> SpeechErrorClassification(
+                userMessage = "Speech service temporarily unreachable.",
+                isServiceOrDeviceFailure = true
+            )
+            10 -> SpeechErrorClassification( // ERROR_TOO_MANY_REQUESTS
+                userMessage = "Speech service rate limited. Switching to filtered mic.",
+                isServiceOrDeviceFailure = true
+            )
+            11 -> SpeechErrorClassification( // ERROR_SERVER_DISCONNECTED
+                userMessage = "Speech service disconnected.",
+                isServiceOrDeviceFailure = true
+            )
+            12, 13 -> SpeechErrorClassification( // LANGUAGE_NOT_SUPPORTED / LANGUAGE_UNAVAILABLE
+                userMessage = "Selected voice language unavailable on this device.",
+                isServiceOrDeviceFailure = true
+            )
+            14, 15 -> SpeechErrorClassification( // CANNOT_CHECK_SUPPORT / CANNOT_LISTEN_TO_DOWNLOAD_EVENTS
+                userMessage = "On-device speech service unavailable.",
+                isServiceOrDeviceFailure = true
+            )
+            else -> SpeechErrorClassification(
+                userMessage = "Speech recognition error ($errorCode).",
+                isServiceOrDeviceFailure = true
+            )
+        }
+    }
+}
+
+private data class PendingSpeechRequest(
+    val text: String,
+    val persona: AssistantPersona,
+    val localeOption: SpeechLocaleOption,
+    val batchId: String
+)
 
 class VoiceAndTtsManager(
     context: Context,
@@ -80,12 +185,13 @@ class VoiceAndTtsManager(
     private val onAmplitudeChanged: (Float) -> Unit,
     private val onPartialSpeech: (String) -> Unit,
     private val onFinalSpeech: (String) -> Unit,
-    private val onSpeechError: (String) -> Unit,
+    private val onSpeechError: (String, Boolean) -> Unit,
     private val onSpeakingStateChanged: (Boolean) -> Unit,
     private val onSpeakingFinished: () -> Unit,
     private val onWakeWordTriggered: (WakeWordMatch) -> Unit = {},
     private val onBargeInDetected: () -> Unit = {},
-    private val onEchoGuardChanged: (Boolean) -> Unit = {}
+    private val onEchoGuardChanged: (Boolean) -> Unit = {},
+    private val continuousCaptureActiveProvider: () -> Boolean = { false }
 ) {
     private val appContext = context.applicationContext
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -94,13 +200,19 @@ class VoiceAndTtsManager(
     private var speechRecognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private var ttsInitFailed = false
+    private var pendingSpeechRequest: PendingSpeechRequest? = null
+    private var commModeAcquiredForOutput = false
+
     private var speakingPulseJob: Job? = null
     private var speakingSafetyJob: Job? = null
     private var piperSpeakJob: Job? = null
     private var bargeInMonitorJob: Job? = null
     private var wakeRearmJob: Job? = null
+    private var recognizerRetryJob: Job? = null
     private var echoGuardClearJob: Job? = null
     private var retriedWithFallbackLocale = false
+    private var retriedAfterBusy = false
 
     @Volatile
     private var activeUtteranceBatchId: String? = null
@@ -120,20 +232,54 @@ class VoiceAndTtsManager(
     @Volatile
     private var voiceEngineModeConfig = "AUTO"
     @Volatile
-    private var selectedEnglishVoiceId = "en_US-lessac-medium-int8"
+    private var selectedEnglishVoiceId = "en_US-ryan-medium-int8"
+    @Volatile
+    private var selectedBanglaVoiceId = "bn_BD-mimic3-multi_low"
+    @Volatile
+    private var voiceSpeedConfig = 1.08f
+    @Volatile
+    private var customAetherPitchConfig = 1.0f
+    @Volatile
+    private var pauseWakeDuringMusicConfig = true
+    @Volatile
+    private var wakeTriggerModeConfig = com.example.data.local.WakeTriggerMode.HYBRID_KWS_AND_BUTTON
+    @Volatile
+    private var kwsThresholdConfig = 0.25f
     @Volatile
     private var activeWakeLocale = SpeechLocaleOption.EN_US
     @Volatile
     private var activeWakeCustomPhrase = "Hey Aether"
     @Volatile
-    private var activeWakePersona = AssistantPersona.JARVIS
+    private var activeWakePersona = AssistantPersona.AETHER
+
+    val localWakeEngine = LocalWakeWordEngine(appContext, commRouter)
 
     init {
-        mainHandler.post {
-            tts = TextToSpeech(appContext) { status ->
+        runOnMain {
+            initializeTts()
+        }
+    }
+
+    private fun runOnMain(block: () -> Unit) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post(block)
+        }
+    }
+
+    private fun initializeTts() {
+        runCatching {
+            tts?.stop()
+            tts?.shutdown()
+        }
+        ttsReady = false
+        ttsInitFailed = false
+        tts = TextToSpeech(appContext) { status ->
+            runOnMain {
                 if (status == TextToSpeech.SUCCESS) {
                     ttsReady = true
-                    tts?.setAudioAttributes(commRouter.voiceCommunicationAttributes())
+                    ttsInitFailed = false
                     tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                         override fun onStart(utteranceId: String?) {
                             mainHandler.post {
@@ -145,7 +291,6 @@ class VoiceAndTtsManager(
                                     isSpeakingOutput = true
                                     onSpeakingStateChanged(true)
                                     startSpeakingCadencePulse()
-                                    startBargeInMonitor(commRouter.detectCurrentOutputRoute())
                                 }
                             }
                         }
@@ -153,7 +298,6 @@ class VoiceAndTtsManager(
                         override fun onDone(utteranceId: String?) {
                             mainHandler.post {
                                 if (!EchoGuardPolicy.shouldFinishUtteranceBatch(utteranceId, activeUtteranceBatchId)) {
-                                    // Intermediate sentence finished; keep half-duplex lock armed!
                                     return@post
                                 }
                                 completeOutputSession(notifyFinished = true)
@@ -162,19 +306,66 @@ class VoiceAndTtsManager(
 
                         @Deprecated("Deprecated in Java")
                         override fun onError(utteranceId: String?) {
+                            handleTtsUtteranceError(utteranceId, -1)
+                        }
+
+                        override fun onError(utteranceId: String?, errorCode: Int) {
+                            handleTtsUtteranceError(utteranceId, errorCode)
+                        }
+
+                        override fun onStop(utteranceId: String?, interrupted: Boolean) {
                             mainHandler.post {
-                                val batchId = activeUtteranceBatchId
-                                if (batchId != null && utteranceId != null && !utteranceId.startsWith(batchId)) {
+                                val batchId = activeUtteranceBatchId ?: return@post
+                                if (utteranceId != null && !utteranceId.startsWith(batchId)) {
                                     return@post
                                 }
-                                completeOutputSession(notifyFinished = true)
+                                if (!interrupted && EchoGuardPolicy.shouldFinishUtteranceBatch(utteranceId, batchId)) {
+                                    completeOutputSession(notifyFinished = true)
+                                }
                             }
                         }
                     })
+
+                    val queued = pendingSpeechRequest
+                    pendingSpeechRequest = null
+                    if (queued != null && activeUtteranceBatchId == queued.batchId) {
+                        val useCommRoute = commRouter.shouldUseVoiceCommunicationForSpeechOutput(
+                            continuousCaptureActiveProvider()
+                        )
+                        val route = acquireSpeechRoute(useCommRoute)
+                        val hasBangla = queued.text.any { it in '\u0980'..'\u09FF' }
+                        speakWithSystemTts(
+                            clean = queued.text,
+                            persona = queued.persona,
+                            localeOption = queued.localeOption,
+                            batchId = queued.batchId,
+                            hasBanglaChars = hasBangla,
+                            route = route,
+                            useCommRoute = useCommRoute
+                        )
+                    }
                 } else {
+                    ttsReady = false
+                    ttsInitFailed = true
                     Log.w(TAG, "TTS initialization failed with status=$status")
+                    val queued = pendingSpeechRequest
+                    pendingSpeechRequest = null
+                    if (queued != null && activeUtteranceBatchId == queued.batchId) {
+                        completeOutputSession(notifyFinished = true)
+                    }
                 }
             }
+        }
+    }
+
+    private fun handleTtsUtteranceError(utteranceId: String?, errorCode: Int) {
+        mainHandler.post {
+            val batchId = activeUtteranceBatchId
+            if (batchId != null && utteranceId != null && !utteranceId.startsWith(batchId)) {
+                return@post
+            }
+            Log.w(TAG, "TTS utterance error code=$errorCode id=$utteranceId")
+            completeOutputSession(notifyFinished = true)
         }
     }
 
@@ -185,8 +376,15 @@ class VoiceAndTtsManager(
         persona: AssistantPersona,
         localeOption: SpeechLocaleOption,
         voiceEngineMode: String = "AUTO",
-        selectedVoiceId: String = "en_US-lessac-medium-int8",
-        bargeInMode: String = "ADAPTIVE"
+        selectedVoiceId: String = "en_US-ryan-medium-int8",
+        selectedBanglaId: String = "bn_BD-mimic3-multi_low",
+        bargeInMode: String = "ADAPTIVE",
+        voiceSpeed: Float = 1.08f,
+        customAetherPitchFactor: Float = 1.0f,
+        pauseWakeDuringMusic: Boolean = true,
+        wakeTriggerMode: com.example.data.local.WakeTriggerMode =
+            com.example.data.local.WakeTriggerMode.HYBRID_KWS_AND_BUTTON,
+        kwsThreshold: Float = 0.25f
     ) {
         wakeWordEnabledConfig = wakeWordEnabled
         bargeInEnabledConfig = bargeInEnabled
@@ -195,11 +393,33 @@ class VoiceAndTtsManager(
         activeWakeLocale = localeOption
         voiceEngineModeConfig = voiceEngineMode
         selectedEnglishVoiceId = selectedVoiceId
+        selectedBanglaVoiceId = selectedBanglaId
         bargeInModeConfig = bargeInMode
+        voiceSpeedConfig = voiceSpeed.coerceIn(0.75f, 1.45f)
+        customAetherPitchConfig = customAetherPitchFactor.coerceIn(0.78f, 1.25f)
+        pauseWakeDuringMusicConfig = pauseWakeDuringMusic
+        wakeTriggerModeConfig = wakeTriggerMode
+        kwsThresholdConfig = kwsThreshold.coerceIn(0.10f, 0.85f)
+    }
+
+    fun playWakeChime() {
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                val tone = android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION, 55)
+                tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP2, 110)
+                delay(160L)
+                tone.release()
+            }
+        }
     }
 
     fun isSpeechRecognitionAvailable(): Boolean {
-        return SpeechRecognizer.isRecognitionAvailable(appContext)
+        if (SpeechRecognizer.isRecognitionAvailable(appContext)) return true
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(appContext) }
+                .getOrDefault(false)
+        }
+        return false
     }
 
     fun isEchoGuardActiveNow(): Boolean {
@@ -218,42 +438,114 @@ class VoiceAndTtsManager(
         }
     }
 
+    private fun acquireSpeechRoute(useCommRoute: Boolean): AudioOutputRoute {
+        return if (useCommRoute) {
+            if (!commModeAcquiredForOutput) {
+                commModeAcquiredForOutput = true
+                commRouter.enterCommunicationMode()
+            } else {
+                commRouter.detectCurrentOutputRoute()
+            }
+        } else {
+            if (commModeAcquiredForOutput) {
+                commModeAcquiredForOutput = false
+                commRouter.exitCommunicationMode()
+            }
+            commRouter.detectCurrentOutputRoute()
+        }
+    }
+
     private fun completeOutputSession(notifyFinished: Boolean) {
+        val wasOutputActive = isSpeakingOutput || activeUtteranceBatchId != null || pendingSpeechRequest != null
         activeUtteranceBatchId = null
+        pendingSpeechRequest = null
         isSpeakingOutput = false
         speakingSafetyJob?.cancel()
         stopBargeInMonitor()
         stopSpeakingCadencePulse()
-        armEchoDecayGuard(ECHO_DECAY_GUARD_MS)
-        commRouter.exitCommunicationMode()
-        onSpeakingStateChanged(false)
+        if (wasOutputActive) {
+            armEchoDecayGuard(ECHO_DECAY_GUARD_MS)
+        }
+        if (commModeAcquiredForOutput) {
+            commModeAcquiredForOutput = false
+            commRouter.exitCommunicationMode()
+        }
+        if (wasOutputActive || notifyFinished) {
+            onSpeakingStateChanged(false)
+        }
         if (notifyFinished) {
             onSpeakingFinished()
         }
     }
 
     fun startWakeWordListening() {
-        if (!wakeWordEnabledConfig || !isSpeechRecognitionAvailable()) return
+        if (wakeTriggerModeConfig == com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY) {
+            stopWakeWordListening()
+            return
+        }
+        if (!wakeWordEnabledConfig) return
         val hasMic = ContextCompat.checkSelfPermission(
             appContext,
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
         if (!hasMic) return
 
-        mainHandler.post {
+        runOnMain {
             val now = SystemClock.elapsedRealtime()
             if (isSpeakingOutput) {
                 Log.d(TAG, "Ignoring wake-word arm while output is active.")
-                return@post
+                return@runOnMain
+            }
+            if (pauseWakeDuringMusicConfig && commRouter.isMusicPlaybackActive()) {
+                isWakeWordMode = true
+                scheduleWakeRearm(1_800L)
+                return@runOnMain
             }
             if (EchoGuardPolicy.isEchoGuardActive(now, echoGuardUntilMs)) {
                 val remaining = (echoGuardUntilMs - now).coerceAtLeast(100L)
                 isWakeWordMode = true
                 scheduleWakeRearm(remaining + 60L)
-                return@post
+                return@runOnMain
             }
             wakeRearmJob?.cancel()
             isWakeWordMode = true
+
+            if (wakeTriggerModeConfig == com.example.data.local.WakeTriggerMode.HYBRID_KWS_AND_BUTTON) {
+                destroyRecognizerQuietly()
+                localWakeEngine.startPassiveMonitor(
+                    customWakePhrase = activeWakeCustomPhrase,
+                    persona = activeWakePersona,
+                    threshold = kwsThresholdConfig,
+                    pauseDuringMusic = pauseWakeDuringMusicConfig,
+                    shouldSuspendProvider = {
+                        !isWakeWordMode || isSpeakingOutput || EchoGuardPolicy.isEchoGuardActive(
+                            SystemClock.elapsedRealtime(),
+                            echoGuardUntilMs
+                        ) || continuousCaptureActiveProvider()
+                    },
+                    onOfflineKeywordHit = { match ->
+                        if (isWakeWordMode && !isEchoGuardActiveNow()) {
+                            isWakeWordMode = false
+                            onWakeWordTriggered(match)
+                        }
+                    },
+                    onVoiceEnergySpeechGate = {
+                        // Silence-gated single recognizer burst ONLY when speech energy detected
+                        if (isWakeWordMode && !isEchoGuardActiveNow() && isSpeechRecognitionAvailable()) {
+                            startRecognizerInternal(
+                                localeOption = activeWakeLocale,
+                                isWakePassive = true,
+                                isLocaleFallbackRetry = false
+                            )
+                        } else if (isWakeWordMode) {
+                            scheduleWakeRearm(900L)
+                        }
+                    }
+                )
+                return@runOnMain
+            }
+
+            if (!isSpeechRecognitionAvailable()) return@runOnMain
             startRecognizerInternal(
                 localeOption = activeWakeLocale,
                 isWakePassive = true,
@@ -263,34 +555,80 @@ class VoiceAndTtsManager(
     }
 
     fun stopWakeWordListening() {
-        mainHandler.post {
+        localWakeEngine.stopPassiveMonitor()
+        runOnMain {
             wakeRearmJob?.cancel()
             if (isWakeWordMode) {
                 isWakeWordMode = false
-                runCatching { speechRecognizer?.cancel() }
+                destroyRecognizerQuietly()
                 onAmplitudeChanged(0f)
             }
         }
     }
 
     fun startListening(localeOption: SpeechLocaleOption, isLocaleFallbackRetry: Boolean = false) {
-        mainHandler.post {
+        localWakeEngine.stopPassiveMonitor()
+        runOnMain {
             wakeRearmJob?.cancel()
+            recognizerRetryJob?.cancel()
+            val wasWake = isWakeWordMode
             isWakeWordMode = false
-            stopSpeaking()
+            stopSpeakingInternal(notifyFinished = false)
+
             if (!isLocaleFallbackRetry) {
                 retriedWithFallbackLocale = false
+                retriedAfterBusy = false
             }
+
+            if (wasWake) {
+                destroyRecognizerQuietly()
+            }
+
             if (!isSpeechRecognitionAvailable()) {
-                onSpeechError("Speech recognition service unavailable on this device. Use the command bar below.")
-                return@post
+                onSpeechError(
+                    "Speech recognition service unavailable on this device. Switching to filtered microphone.",
+                    true
+                )
+                return@runOnMain
             }
-            startRecognizerInternal(
-                localeOption = localeOption,
-                isWakePassive = false,
-                isLocaleFallbackRetry = isLocaleFallbackRetry
-            )
+
+            if (wasWake) {
+                // Brief yield so system SpeechRecognizer binder finishes releasing passive session
+                recognizerRetryJob = scope.launch {
+                    delay(90L)
+                    startRecognizerInternal(
+                        localeOption = localeOption,
+                        isWakePassive = false,
+                        isLocaleFallbackRetry = isLocaleFallbackRetry
+                    )
+                }
+            } else {
+                startRecognizerInternal(
+                    localeOption = localeOption,
+                    isWakePassive = false,
+                    isLocaleFallbackRetry = isLocaleFallbackRetry
+                )
+            }
         }
+    }
+
+    private fun destroyRecognizerQuietly() {
+        val current = speechRecognizer
+        speechRecognizer = null
+        if (current != null) {
+            runCatching { current.cancel() }
+            runCatching { current.destroy() }
+        }
+    }
+
+    private fun createBestSpeechRecognizer(): SpeechRecognizer {
+        val hasStandard = SpeechRecognizer.isRecognitionAvailable(appContext)
+        if (!hasStandard && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (runCatching { SpeechRecognizer.isOnDeviceRecognitionAvailable(appContext) }.getOrDefault(false)) {
+                return SpeechRecognizer.createOnDeviceSpeechRecognizer(appContext)
+            }
+        }
+        return SpeechRecognizer.createSpeechRecognizer(appContext)
     }
 
     private fun startRecognizerInternal(
@@ -305,8 +643,9 @@ class VoiceAndTtsManager(
             return
         }
         try {
-            speechRecognizer?.destroy()
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(appContext).apply {
+            destroyRecognizerQuietly()
+            val created = createBestSpeechRecognizer()
+            speechRecognizer = created.apply {
                 setRecognitionListener(object : RecognitionListener {
                     override fun onReadyForSpeech(params: Bundle?) {
                         if (!isWakePassive) {
@@ -347,26 +686,41 @@ class VoiceAndTtsManager(
                             return
                         }
 
-                        if ((error == 12 || error == 13 || error == SpeechRecognizer.ERROR_CLIENT) && !isLocaleFallbackRetry && !retriedWithFallbackLocale) {
-                            retriedWithFallbackLocale = true
-                            Log.w(TAG, "SpeechRecognizer error=$error for ${localeOption.languageTag}, retrying with en-US")
-                            startListening(SpeechLocaleOption.EN_US, isLocaleFallbackRetry = true)
+                        val classified = SpeechErrorPolicy.classifyError(error)
+
+                        if (classified.shouldRetryBusy && !retriedAfterBusy) {
+                            retriedAfterBusy = true
+                            Log.w(TAG, "SpeechRecognizer busy (code=$error); destroying and retrying after 250ms")
+                            destroyRecognizerQuietly()
+                            recognizerRetryJob?.cancel()
+                            recognizerRetryJob = scope.launch {
+                                delay(250L)
+                                startRecognizerInternal(
+                                    localeOption = localeOption,
+                                    isWakePassive = false,
+                                    isLocaleFallbackRetry = isLocaleFallbackRetry
+                                )
+                            }
                             return
                         }
-                        val msg = when (error) {
-                            SpeechRecognizer.ERROR_AUDIO -> "Audio recording error."
-                            SpeechRecognizer.ERROR_CLIENT -> "Voice recognizer unavailable. Type your command below."
-                            SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Microphone permission required."
-                            SpeechRecognizer.ERROR_NETWORK, SpeechRecognizer.ERROR_NETWORK_TIMEOUT ->
-                                "Network unavailable for speech recognition."
-                            SpeechRecognizer.ERROR_NO_MATCH -> "Didn't catch any speech. Tap mic or type below."
-                            SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "No speech detected."
-                            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Speech recognizer busy, please retry."
-                            SpeechRecognizer.ERROR_SERVER -> "Speech service temporarily unreachable."
-                            12, 13 -> "Selected voice language unavailable on this device."
-                            else -> "Speech recognition error ($error)."
+
+                        if ((error == 12 || error == 13 || error == SpeechRecognizer.ERROR_CLIENT) &&
+                            localeOption != SpeechLocaleOption.EN_US &&
+                            !isLocaleFallbackRetry &&
+                            !retriedWithFallbackLocale
+                        ) {
+                            retriedWithFallbackLocale = true
+                            Log.w(TAG, "SpeechRecognizer error=$error for ${localeOption.languageTag}, retrying with en-US")
+                            startRecognizerInternal(
+                                localeOption = SpeechLocaleOption.EN_US,
+                                isWakePassive = false,
+                                isLocaleFallbackRetry = true
+                            )
+                            return
                         }
-                        onSpeechError(msg)
+
+                        Log.w(TAG, "SpeechRecognizer active error=$error (${classified.userMessage})")
+                        onSpeechError(classified.userMessage, classified.isServiceOrDeviceFailure)
                     }
 
                     override fun onResults(results: Bundle?) {
@@ -395,7 +749,7 @@ class VoiceAndTtsManager(
                         if (best.isNotBlank()) {
                             onFinalSpeech(best)
                         } else {
-                            onSpeechError("No speech recognized. Try again.")
+                            onSpeechError("No speech recognized. Try again.", false)
                         }
                     }
 
@@ -441,13 +795,16 @@ class VoiceAndTtsManager(
                     putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 900L)
                 }
             }
-            speechRecognizer?.startListening(intent)
+            created.startListening(intent)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start SpeechRecognizer", e)
             if (isWakePassive) {
                 scheduleWakeRearm(2_000L)
             } else {
-                onSpeechError(e.localizedMessage ?: "Could not start voice listener.")
+                onSpeechError(
+                    e.localizedMessage ?: "Could not start voice listener.",
+                    true
+                )
             }
         }
     }
@@ -456,32 +813,42 @@ class VoiceAndTtsManager(
         wakeRearmJob?.cancel()
         wakeRearmJob = scope.launch {
             delay(delayMs)
+            if (wakeTriggerModeConfig == com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY) {
+                return@launch
+            }
             val now = SystemClock.elapsedRealtime()
             if (isSpeakingOutput) {
                 scheduleWakeRearm(600L)
+                return@launch
+            }
+            if (pauseWakeDuringMusicConfig && commRouter.isMusicPlaybackActive()) {
+                scheduleWakeRearm(1_800L)
                 return@launch
             }
             if (EchoGuardPolicy.isEchoGuardActive(now, echoGuardUntilMs)) {
                 delay((echoGuardUntilMs - now + 60L).coerceAtLeast(80L))
             }
             if (isWakeWordMode && wakeWordEnabledConfig && !isSpeakingOutput) {
-                startRecognizerInternal(
-                    localeOption = activeWakeLocale,
-                    isWakePassive = true,
-                    isLocaleFallbackRetry = false
-                )
+                if (wakeTriggerModeConfig == com.example.data.local.WakeTriggerMode.HYBRID_KWS_AND_BUTTON) {
+                    startWakeWordListening()
+                } else {
+                    startRecognizerInternal(
+                        localeOption = activeWakeLocale,
+                        isWakePassive = true,
+                        isLocaleFallbackRetry = false
+                    )
+                }
             }
         }
     }
 
     fun stopListening() {
-        mainHandler.post {
+        localWakeEngine.stopPassiveMonitor()
+        runOnMain {
             wakeRearmJob?.cancel()
+            recognizerRetryJob?.cancel()
             isWakeWordMode = false
-            try {
-                speechRecognizer?.stopListening()
-            } catch (_: Exception) {
-            }
+            destroyRecognizerQuietly()
             onAmplitudeChanged(0f)
         }
     }
@@ -493,35 +860,47 @@ class VoiceAndTtsManager(
     ) {
         val clean = text.trim()
         if (clean.isBlank()) {
-            mainHandler.post { completeOutputSession(notifyFinished = true) }
+            runOnMain { completeOutputSession(notifyFinished = true) }
             return
         }
 
-        mainHandler.post {
+        localWakeEngine.stopPassiveMonitor()
+        runOnMain {
             // Hard half-duplex lock: terminate passive wake-word or active SpeechRecognizer immediately
             wakeRearmJob?.cancel()
+            recognizerRetryJob?.cancel()
             piperSpeakJob?.cancel()
             speakingSafetyJob?.cancel()
             stopBargeInMonitor()
             if (isWakeWordMode) {
                 isWakeWordMode = false
             }
-            runCatching { speechRecognizer?.cancel() }
+            destroyRecognizerQuietly()
 
             val batchId = UUID.randomUUID().toString()
             activeUtteranceBatchId = batchId
-            val route = commRouter.enterCommunicationMode()
+            val useCommRoute = commRouter.shouldUseVoiceCommunicationForSpeechOutput(
+                continuousCaptureActiveProvider()
+            )
+            val route = acquireSpeechRoute(useCommRoute)
 
             val hasBanglaChars = clean.any { it in '\u0980'..'\u09FF' }
-            val preferPiper = !hasBanglaChars &&
-                localeOption != SpeechLocaleOption.BN_BD &&
-                voiceEngineModeConfig != "SYSTEM"
+            val preferBangla = hasBanglaChars || localeOption == SpeechLocaleOption.BN_BD
+            val preferPiper = voiceEngineModeConfig != "SYSTEM" &&
+                piperManager.isNativeRuntimeLikelySupported()
 
             val installedPack = if (preferPiper) {
-                piperManager.pickBestInstalledPack(selectedEnglishVoiceId, persona)
+                piperManager.pickBestInstalledPack(
+                    preferredId = if (preferBangla) selectedBanglaVoiceId else selectedEnglishVoiceId,
+                    persona = persona,
+                    preferBangla = preferBangla
+                )
             } else {
                 null
             }
+
+            val effectiveSpeed = (persona.ttsRate * (voiceSpeedConfig / 1.08f)).coerceIn(0.75f, 1.45f)
+            val effectivePitchFactor = if (persona == AssistantPersona.AETHER) customAetherPitchConfig else 1.0f
 
             if (installedPack != null) {
                 isSpeakingOutput = true
@@ -531,28 +910,51 @@ class VoiceAndTtsManager(
                     val spokeOk = piperManager.speakWithPack(
                         text = clean,
                         pack = installedPack,
-                        speed = persona.ttsRate,
-                        audioAttributes = commRouter.voiceCommunicationAttributes(),
+                        speed = effectiveSpeed,
+                        pitchFactor = effectivePitchFactor,
+                        audioAttributes = commRouter.speechOutputAttributes(useCommRoute),
                         onAmplitude = { amp -> onAmplitudeChanged(amp) }
                     )
                     if (activeUtteranceBatchId == batchId) {
                         if (spokeOk) {
                             completeOutputSession(notifyFinished = true)
                         } else if (ttsReady) {
-                            speakWithSystemTts(clean, persona, localeOption, batchId, hasBanglaChars, route)
+                            speakWithSystemTts(clean, persona, localeOption, batchId, hasBanglaChars, route, useCommRoute)
                         } else {
-                            completeOutputSession(notifyFinished = true)
+                            queuePendingSpeech(clean, persona, localeOption, batchId)
                         }
                     }
                 }
-                return@post
+                return@runOnMain
             }
 
             if (!ttsReady) {
-                completeOutputSession(notifyFinished = true)
-                return@post
+                queuePendingSpeech(clean, persona, localeOption, batchId)
+                return@runOnMain
             }
-            speakWithSystemTts(clean, persona, localeOption, batchId, hasBanglaChars, route)
+            speakWithSystemTts(clean, persona, localeOption, batchId, hasBanglaChars, route, useCommRoute)
+        }
+    }
+
+    private fun queuePendingSpeech(
+        clean: String,
+        persona: AssistantPersona,
+        localeOption: SpeechLocaleOption,
+        batchId: String
+    ) {
+        pendingSpeechRequest = PendingSpeechRequest(clean, persona, localeOption, batchId)
+        isSpeakingOutput = true
+        onSpeakingStateChanged(true)
+        if (ttsInitFailed || tts == null) {
+            initializeTts()
+        }
+        speakingSafetyJob?.cancel()
+        speakingSafetyJob = scope.launch {
+            delay(6_000L)
+            if (activeUtteranceBatchId == batchId && pendingSpeechRequest?.batchId == batchId) {
+                Log.w(TAG, "TTS initialization wait timed out; releasing speaking state")
+                completeOutputSession(notifyFinished = true)
+            }
         }
     }
 
@@ -562,13 +964,14 @@ class VoiceAndTtsManager(
         localeOption: SpeechLocaleOption,
         batchId: String,
         hasBanglaChars: Boolean,
-        route: AudioOutputRoute
+        route: AudioOutputRoute,
+        useCommRoute: Boolean
     ) {
         try {
             val effectiveTag = if (hasBanglaChars) "bn-BD" else localeOption.languageTag
             val targetLocale = Locale.forLanguageTag(effectiveTag)
 
-            tts?.setAudioAttributes(commRouter.voiceCommunicationAttributes())
+            tts?.setAudioAttributes(commRouter.speechOutputAttributes(useCommRoute))
             val res = tts?.setLanguage(targetLocale)
             if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
                 val altLocale = if (hasBanglaChars || effectiveTag.startsWith("bn")) {
@@ -586,8 +989,10 @@ class VoiceAndTtsManager(
                 tts?.voice = bestVoice
             }
 
-            tts?.setPitch(persona.ttsPitch)
-            tts?.setSpeechRate(persona.ttsRate)
+            val pitchMultiplier = if (persona == AssistantPersona.AETHER) customAetherPitchConfig else 1.0f
+            val speedRate = (persona.ttsRate * (voiceSpeedConfig / 1.08f)).coerceIn(0.75f, 1.45f)
+            tts?.setPitch((persona.ttsPitch * pitchMultiplier).coerceIn(0.75f, 1.35f))
+            tts?.setSpeechRate(speedRate)
 
             val sentences = clean.split(Regex("(?<=[.!?।])\\s+"))
                 .map { it.trim() }
@@ -611,6 +1016,7 @@ class VoiceAndTtsManager(
             }
 
             if (finalResult != TextToSpeech.SUCCESS) {
+                Log.w(TAG, "tts.speak returned error code=$finalResult")
                 completeOutputSession(notifyFinished = true)
             } else {
                 isSpeakingOutput = true
@@ -649,9 +1055,7 @@ class VoiceAndTtsManager(
         bargeInMonitorJob = scope.launch(Dispatchers.IO) {
             delay(450L)
             var record: AudioRecord? = null
-            var aec: AcousticEchoCanceler? = null
-            var ns: NoiseSuppressor? = null
-            var agc: AutomaticGainControl? = null
+            val effectController = HardwareAudioEffectController()
             try {
                 val sampleRate = 16000
                 val minBuf = AudioRecord.getMinBufferSize(
@@ -659,8 +1063,8 @@ class VoiceAndTtsManager(
                     AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT
                 )
-                if (minBuf <= 0) return@launch
-                val bufSize = (minBuf * 2).coerceAtLeast(2048)
+                val safeMinBuf = if (minBuf > 0) minBuf else 2048
+                val bufSize = (safeMinBuf * 2).coerceAtLeast(4096)
 
                 record = AudioRecord(
                     MediaRecorder.AudioSource.VOICE_COMMUNICATION,
@@ -671,24 +1075,15 @@ class VoiceAndTtsManager(
                 )
                 if (record.state != AudioRecord.STATE_INITIALIZED) return@launch
 
-                val sessionId = record.audioSessionId
-                if (AcousticEchoCanceler.isAvailable()) {
-                    aec = runCatching {
-                        AcousticEchoCanceler.create(sessionId)?.apply { enabled = true }
-                    }.getOrNull()
-                }
-                if (NoiseSuppressor.isAvailable()) {
-                    ns = runCatching {
-                        NoiseSuppressor.create(sessionId)?.apply { enabled = true }
-                    }.getOrNull()
-                }
-                if (AutomaticGainControl.isAvailable()) {
-                    agc = runCatching {
-                        AutomaticGainControl.create(sessionId)?.apply { enabled = true }
-                    }.getOrNull()
+                val caps = effectController.attachToSession(record.audioSessionId)
+                // On loudspeaker without hardware AEC, speaker playback self-triggers RMS barge-in;
+                // rely on tap-to-interrupt or headset barge-in to avoid cutting off Aether's own voice.
+                if (route == AudioOutputRoute.LOUDSPEAKER && !caps.isAecActive) {
+                    return@launch
                 }
 
                 record.startRecording()
+                if (record.recordingState != AudioRecord.RECORDSTATE_RECORDING) return@launch
                 val shortBuf = ShortArray(bufSize / 2)
 
                 // Calibrate residual speaker echo floor over ~300ms before arming trigger
@@ -714,7 +1109,7 @@ class VoiceAndTtsManager(
                             if (loudFrames >= requiredFrames) {
                                 Log.i(TAG, "Barge-in triggered (route=$route, rms=${rms.toInt()}, thr=${threshold.toInt()})")
                                 mainHandler.post {
-                                    stopSpeaking()
+                                    stopSpeakingInternal(notifyFinished = false)
                                     onBargeInDetected()
                                 }
                                 break
@@ -728,11 +1123,11 @@ class VoiceAndTtsManager(
             } catch (e: Exception) {
                 Log.d(TAG, "Barge-in monitor stopped/unavailable: ${e.message}")
             } finally {
-                runCatching { agc?.release() }
-                runCatching { ns?.release() }
-                runCatching { aec?.release() }
+                effectController.release()
                 runCatching {
-                    record?.stop()
+                    if (record?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                        record.stop()
+                    }
                     record?.release()
                 }
             }
@@ -766,7 +1161,7 @@ class VoiceAndTtsManager(
         }
         if (candidates.isEmpty()) return null
 
-        val prefersFemale = persona == AssistantPersona.MAYRA
+        val prefersFemale = persona == AssistantPersona.ARIA
         return candidates.maxByOrNull { voice ->
             var score = 0
             val name = voice.name.lowercase(Locale.US)
@@ -794,16 +1189,20 @@ class VoiceAndTtsManager(
     }
 
     fun stopSpeaking() {
-        mainHandler.post {
-            piperSpeakJob?.cancel()
-            piperSpeakJob = null
-            piperManager.stopPlayback()
-            try {
-                tts?.stop()
-            } catch (_: Exception) {
-            }
-            completeOutputSession(notifyFinished = false)
+        runOnMain {
+            stopSpeakingInternal(notifyFinished = false)
         }
+    }
+
+    private fun stopSpeakingInternal(notifyFinished: Boolean) {
+        piperSpeakJob?.cancel()
+        piperSpeakJob = null
+        piperManager.stopPlayback()
+        try {
+            tts?.stop()
+        } catch (_: Exception) {
+        }
+        completeOutputSession(notifyFinished = notifyFinished)
     }
 
     private fun startSpeakingCadencePulse() {
@@ -828,17 +1227,20 @@ class VoiceAndTtsManager(
 
     fun release() {
         wakeRearmJob?.cancel()
+        recognizerRetryJob?.cancel()
         echoGuardClearJob?.cancel()
         speakingSafetyJob?.cancel()
         piperSpeakJob?.cancel()
         piperManager.release()
         stopBargeInMonitor()
         stopSpeakingCadencePulse()
-        commRouter.exitCommunicationMode()
-        mainHandler.post {
+        if (commModeAcquiredForOutput) {
+            commModeAcquiredForOutput = false
+            commRouter.exitCommunicationMode()
+        }
+        runOnMain {
             try {
-                speechRecognizer?.destroy()
-                speechRecognizer = null
+                destroyRecognizerQuietly()
                 tts?.stop()
                 tts?.shutdown()
                 tts = null

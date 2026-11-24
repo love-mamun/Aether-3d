@@ -16,7 +16,10 @@ import com.example.data.local.MemoryNoteEntity
 import com.example.data.local.QuickContactEntity
 import com.example.data.local.ReminderEntity
 import com.example.data.local.ScreenMacroEntity
+import com.example.data.local.VisionTokenMode
 import com.example.data.local.VoiceRoutineEntity
+import com.example.data.local.WakeTriggerMode
+import com.example.service.ScreenVisionService
 import com.example.service.VoiceAgentService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.SharingStarted
@@ -82,6 +85,8 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
+    fun selectPersona(persona: com.example.ai.AssistantPersona) = orchestrator.selectPersona(persona)
+
     fun cyclePersona() = orchestrator.cyclePersona()
 
     fun setSpeechLocale(option: SpeechLocaleOption) {
@@ -110,6 +115,52 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         orchestrator.updatePreferences { it.copy(wakeWordEnabled = !it.wakeWordEnabled) }
     }
 
+    fun updateWakeWordPhrase(phrase: String) {
+        val clean = phrase.trim()
+        if (clean.isNotBlank()) {
+            orchestrator.updatePreferences { it.copy(customWakeWord = clean) }
+        }
+    }
+
+    fun togglePauseWakeDuringMusic() {
+        orchestrator.updatePreferences { it.copy(pauseWakeDuringMusic = !it.pauseWakeDuringMusic) }
+    }
+
+    fun setWakeTriggerMode(mode: WakeTriggerMode) {
+        val wakeEnabled = mode != WakeTriggerMode.ASSISTANT_BUTTON_ONLY
+        orchestrator.updatePreferences {
+            it.copy(
+                wakeTriggerMode = mode,
+                wakeWordEnabled = wakeEnabled
+            )
+        }
+    }
+
+    fun downloadKwsPack() {
+        orchestrator.downloadKwsModelPack()
+    }
+
+    fun stopDeepScreenVision() {
+        orchestrator.stopDeepScreenVision()
+        runCatching { ScreenVisionService.stop(getApplication()) }
+    }
+
+    fun setVisionTokenMode(mode: VisionTokenMode) {
+        orchestrator.updatePreferences { it.copy(visionTokenMode = mode) }
+    }
+
+    fun startVoiceFromExternalTrigger() {
+        val snapshot = permissionsManager.checkSnapshot()
+        if (!snapshot.micGranted) {
+            refreshPermissionsAndTelemetry()
+            return
+        }
+        val mode = uiState.value.coreMode
+        if (mode != CoreMode.LISTENING) {
+            orchestrator.startListening(initialBanner = "Assistant triggered · Listening...")
+        }
+    }
+
     fun toggleBargeIn() {
         orchestrator.updatePreferences { it.copy(bargeInEnabled = !it.bargeInEnabled) }
     }
@@ -118,13 +169,36 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         orchestrator.updatePreferences { it.copy(voiceEngineMode = mode) }
     }
 
+    fun setVoiceSpeed(speed: Float) {
+        orchestrator.updatePreferences { it.copy(voiceSpeed = speed.coerceIn(0.8f, 1.4f)) }
+    }
+
     fun setBargeInMode(mode: String) {
         orchestrator.updatePreferences { it.copy(bargeInMode = mode) }
     }
 
+    fun toggleFilteredMicMode() {
+        val next = !uiState.value.preferences.filteredMicEnabled
+        orchestrator.updatePreferences { it.copy(filteredMicEnabled = next) }
+        if (!next) {
+            orchestrator.stopFilteredBackgroundCapture()
+        } else if (uiState.value.backgroundServiceActive && !uiState.value.backgroundServicePaused) {
+            orchestrator.startFilteredBackgroundCapture()
+        }
+    }
+
     fun downloadVoicePack(packId: String) = orchestrator.downloadVoicePack(packId)
 
-    fun selectVoicePack(packId: String) = orchestrator.selectVoicePack(packId)
+    fun selectVoicePack(
+        packId: String,
+        targetPersona: com.example.ai.AssistantPersona? = null
+    ) = orchestrator.selectVoicePack(packId, targetPersona)
+
+    fun importAetherVoiceSample(uri: Uri) = orchestrator.importAetherVoiceSample(uri)
+
+    fun previewImportedAetherSample() = orchestrator.previewImportedAetherSample()
+
+    fun importCustomOnnxModel(uri: Uri) = orchestrator.importCustomOnnxModel(uri)
 
     fun deleteVoicePack(packId: String) = orchestrator.deleteVoicePack(packId)
 
@@ -169,6 +243,16 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
 
     fun markOnboardingSeen() {
         orchestrator.updatePreferences { it.copy(hasCompletedOnboardingPrompt = true) }
+    }
+
+    fun saveApiSettings(
+        nvidiaKey: String,
+        nvidiaModel: String,
+        preferPrimary: Boolean,
+        geminiKey: String,
+        geminiModel: String
+    ) {
+        orchestrator.saveApiSettings(nvidiaKey, nvidiaModel, preferPrimary, geminiKey, geminiModel)
     }
 
     fun saveNvidiaSettings(apiKey: String, model: String, preferPrimary: Boolean) {

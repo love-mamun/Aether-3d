@@ -8,8 +8,15 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
-import org.json.JSONObject
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
 import java.util.concurrent.TimeUnit
 
 private const val TAG = "NvidiaFallbackService"
@@ -105,8 +112,8 @@ class NvidiaFallbackService(
     }
 
     internal fun parseAndRankChatModels(rawModelsJson: String): List<String> {
-        val root = JSONObject(rawModelsJson)
-        val data = root.optJSONArray("data") ?: return emptyList()
+        val root = lenientJson.parseToJsonElement(rawModelsJson).jsonObject
+        val data = root["data"] as? JsonArray ?: return emptyList()
         val excluded = listOf(
             "embed", "rerank", "parse", "guard", "shield", "reward", "safety",
             "clip", "ocr", "asr", "tts", "whisper", "diffusion", "flux", "sdxl",
@@ -115,8 +122,10 @@ class NvidiaFallbackService(
             "alphafold", "molmim", "bionemo", "genmol", "vista", "maisi"
         )
         val ids = buildList {
-            for (i in 0 until data.length()) {
-                val id = data.optJSONObject(i)?.optString("id", "").orEmpty().trim()
+            for (elem in data) {
+                val idPrim = (elem as? JsonObject)?.get("id") as? JsonPrimitive ?: continue
+                if (idPrim is JsonNull) continue
+                val id = idPrim.content.trim()
                 if (id.isBlank()) continue
                 val lower = id.lowercase()
                 if (excluded.any { lower.contains(it) }) continue
@@ -143,6 +152,7 @@ class NvidiaFallbackService(
     suspend fun generateCommandJson(
         systemPersonaPrompt: String,
         fullPrompt: String,
+        conversationHistory: List<Pair<String, String>> = emptyList(),
         onStreamPartial: ((String) -> Unit)? = null,
         onModelUsed: ((String) -> Unit)? = null
     ): Result<String> = withContext(Dispatchers.IO) {
@@ -151,10 +161,11 @@ class NvidiaFallbackService(
                 IllegalStateException("NVIDIA API key is not configured. Tap Configure NVIDIA API & Key in the app.")
             )
         }
-        val sysPrompt = "$systemPersonaPrompt You MUST respond with a single valid JSON object matching {\"reply\": string, \"needsScreenObservation\": boolean, \"continueLoopAfterAction\": boolean, \"steps\": [{\"stepId\": string, \"dependsOn\": [string], \"timeoutMs\": integer, \"actionType\": string, \"label\": string, \"target\": string, \"textPayload\": string, \"intValue\": integer, \"secondaryIntValue\": integer, \"doubleValue\": number, \"boolValue\": boolean, \"isBackgroundParallel\": boolean, \"isSensitive\": boolean}]}. Use only valid ActionType names from the instructions."
+        val sysPrompt = "$systemPersonaPrompt You MUST respond with a single valid JSON object matching {\"reply\": string, \"needsScreenObservation\": boolean, \"continueLoopAfterAction\": boolean, \"steps\": [{\"stepId\": string, \"dependsOn\": [string], \"timeoutMs\": integer, \"actionType\": string, \"label\": string, \"target\": string, \"recipient\": string, \"textPayload\": string, \"intValue\": integer, \"secondaryIntValue\": integer, \"doubleValue\": number, \"boolValue\": boolean, \"isBackgroundParallel\": boolean, \"isSensitive\": boolean}]}. Use only valid ActionType names from the instructions. When prior chat turns exist in messages[], use them together with stored SQLite memories so you always remember the user's previous words and facts. In 'reply', answer ONLY what the user asked or concisely confirm the action for TTS — NEVER describe screen UI, OCR text, or device telemetry unless explicitly asked."
         callChatCompletionWithAutoModelRecovery(
             systemPrompt = sysPrompt,
             userPrompt = fullPrompt,
+            conversationHistory = conversationHistory,
             temperature = 0.25,
             maxTokens = 1024,
             stream = onStreamPartial != null,
@@ -193,6 +204,7 @@ class NvidiaFallbackService(
     private fun callChatCompletionWithAutoModelRecovery(
         systemPrompt: String,
         userPrompt: String,
+        conversationHistory: List<Pair<String, String>> = emptyList(),
         temperature: Double,
         maxTokens: Int,
         stream: Boolean = false,
@@ -213,6 +225,7 @@ class NvidiaFallbackService(
             modelId = initialModel,
             systemPrompt = systemPrompt,
             userPrompt = userPrompt,
+            conversationHistory = conversationHistory,
             temperature = temperature,
             maxTokens = maxTokens,
             stream = stream,
@@ -228,6 +241,7 @@ class NvidiaFallbackService(
                 modelId = initialModel,
                 systemPrompt = systemPrompt,
                 userPrompt = userPrompt,
+                conversationHistory = conversationHistory,
                 temperature = temperature,
                 maxTokens = maxTokens,
                 stream = false,
@@ -258,6 +272,7 @@ class NvidiaFallbackService(
                 modelId = candidate,
                 systemPrompt = systemPrompt,
                 userPrompt = userPrompt,
+                conversationHistory = conversationHistory,
                 temperature = temperature,
                 maxTokens = maxTokens,
                 stream = stream,
@@ -281,35 +296,69 @@ class NvidiaFallbackService(
         val result: Result<String>
     )
 
+    internal fun buildChatCompletionPayload(
+        modelId: String,
+        systemPrompt: String,
+        userPrompt: String,
+        conversationHistory: List<Pair<String, String>> = emptyList(),
+        temperature: Double = 0.25,
+        maxTokens: Int = 1024,
+        stream: Boolean = false
+    ): String {
+        val recentHistory = conversationHistory.takeLast(10)
+        return buildJsonObject {
+            put("model", modelId)
+            put("messages", buildJsonArray {
+                add(buildJsonObject {
+                    put("role", "system")
+                    put("content", systemPrompt)
+                })
+                for ((pastUser, pastAssistant) in recentHistory) {
+                    val u = pastUser.trim().take(400)
+                    val a = pastAssistant.trim().take(480)
+                    if (u.isNotBlank() && a.isNotBlank()) {
+                        add(buildJsonObject {
+                            put("role", "user")
+                            put("content", u)
+                        })
+                        add(buildJsonObject {
+                            put("role", "assistant")
+                            put("content", a)
+                        })
+                    }
+                }
+                add(buildJsonObject {
+                    put("role", "user")
+                    put("content", userPrompt)
+                })
+            })
+            put("temperature", temperature)
+            put("max_tokens", maxTokens)
+            put("stream", stream)
+        }.toString()
+    }
+
     private fun executeChatRequest(
         resolvedKey: String,
         modelId: String,
         systemPrompt: String,
         userPrompt: String,
+        conversationHistory: List<Pair<String, String>>,
         temperature: Double,
         maxTokens: Int,
         stream: Boolean,
         onStreamDeltaAccumulated: ((String) -> Unit)?
     ): ChatAttempt {
         return try {
-            val messages = JSONArray().apply {
-                put(JSONObject().apply {
-                    put("role", "system")
-                    put("content", systemPrompt)
-                })
-                put(JSONObject().apply {
-                    put("role", "user")
-                    put("content", userPrompt)
-                })
-            }
-
-            val payload = JSONObject().apply {
-                put("model", modelId)
-                put("messages", messages)
-                put("temperature", temperature)
-                put("max_tokens", maxTokens)
-                put("stream", stream)
-            }.toString()
+            val payload = buildChatCompletionPayload(
+                modelId = modelId,
+                systemPrompt = systemPrompt,
+                userPrompt = userPrompt,
+                conversationHistory = conversationHistory,
+                temperature = temperature,
+                maxTokens = maxTokens,
+                stream = stream
+            )
 
             val request = Request.Builder()
                 .url(NVIDIA_ENDPOINT)
@@ -326,7 +375,7 @@ class NvidiaFallbackService(
                     Log.w(TAG, "NVIDIA NIM HTTP ${response.code} for '$modelId': $apiErr")
                     return ChatAttempt(
                         httpCode = response.code,
-                        result = Result.failure(IllegalStateException("NVIDIA fallback error (${response.code}): $apiErr"))
+                        result = Result.failure(IllegalStateException("NVIDIA NIM error (${response.code}): $apiErr"))
                     )
                 }
 
@@ -381,36 +430,43 @@ class NvidiaFallbackService(
 
     internal fun extractSseDeltaContent(sseDataJson: String): String {
         return runCatching {
-            val root = JSONObject(sseDataJson)
-            val choices = root.optJSONArray("choices") ?: return ""
-            if (choices.length() == 0) return ""
-            val choice = choices.optJSONObject(0) ?: return ""
-            val delta = choice.optJSONObject("delta")
-            if (delta != null) {
-                delta.optString("content", "")
+            val root = lenientJson.parseToJsonElement(sseDataJson).jsonObject
+            val choices = root["choices"] as? JsonArray ?: return ""
+            val choice = choices.firstOrNull() as? JsonObject ?: return ""
+            val delta = choice["delta"] as? JsonObject
+            val contentPrim = if (delta != null) {
+                delta["content"] as? JsonPrimitive
             } else {
-                choice.optJSONObject("message")?.optString("content", "").orEmpty()
+                (choice["message"] as? JsonObject)?.get("content") as? JsonPrimitive
             }
+            if (contentPrim != null && contentPrim !is JsonNull) contentPrim.content else ""
         }.getOrDefault("")
     }
 
     internal fun extractAssistantContent(rawResponseJson: String): String {
-        val root = JSONObject(rawResponseJson)
-        val choices = root.optJSONArray("choices") ?: return ""
-        if (choices.length() == 0) return ""
-        val firstChoice = choices.optJSONObject(0) ?: return ""
-        val message = firstChoice.optJSONObject("message") ?: return ""
-        return message.optString("content", "").trim()
+        return runCatching {
+            val root = lenientJson.parseToJsonElement(rawResponseJson).jsonObject
+            val choices = root["choices"] as? JsonArray ?: return ""
+            val firstChoice = choices.firstOrNull() as? JsonObject ?: return ""
+            val message = firstChoice["message"] as? JsonObject ?: return ""
+            val prim = message["content"] as? JsonPrimitive ?: return ""
+            if (prim is JsonNull) "" else prim.content.trim()
+        }.getOrDefault("")
     }
 
     internal fun extractApiError(rawBody: String, httpCode: Int): String {
         if (rawBody.isBlank()) return "HTTP $httpCode"
         return runCatching {
-            val obj = JSONObject(rawBody)
-            obj.optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
-                ?: obj.optString("detail").takeIf { it.isNotBlank() }
-                ?: obj.optString("title").takeIf { it.isNotBlank() }
-                ?: "HTTP $httpCode"
+            val obj = lenientJson.parseToJsonElement(rawBody).jsonObject
+            val errMsg = ((obj["error"] as? JsonObject)?.get("message") as? JsonPrimitive)
+                ?.takeIf { it !is JsonNull && it.content.isNotBlank() }?.content
+            val detail = (obj["detail"] as? JsonPrimitive)
+                ?.takeIf { it !is JsonNull && it.content.isNotBlank() }?.content
+            val title = (obj["title"] as? JsonPrimitive)
+                ?.takeIf { it !is JsonNull && it.content.isNotBlank() }?.content
+            errMsg ?: detail ?: title ?: "HTTP $httpCode"
         }.getOrDefault("HTTP $httpCode")
     }
+
+    private val lenientJson = Json { ignoreUnknownKeys = true; isLenient = true }
 }

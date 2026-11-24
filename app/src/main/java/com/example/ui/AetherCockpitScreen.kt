@@ -1,9 +1,7 @@
 package com.example.ui
 
-import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -22,15 +20,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -48,6 +39,7 @@ import com.example.data.local.BiometricVaultHelper
 import com.example.ui.components.CoreStatusAndReplyOverlay
 import com.example.ui.components.NvidiaApiDialog
 import com.example.ui.components.PermissionsWizardSheet
+import com.example.ui.components.SettingsHubSheet
 import com.example.ui.components.TacticalCornerReticles
 import com.example.ui.components.TopTelemetryBar
 import com.example.ui.components.VaultBottomSheet
@@ -56,8 +48,6 @@ import com.example.ui.components.VoiceDock
 import com.example.ui.components.VoiceStudioBottomSheet
 import com.example.ui.gl.Aether3DViewport
 import com.example.ui.theme.DeepCockpit
-import com.example.ui.theme.HudTextPrimary
-import com.example.ui.theme.SmokedGlassElevated
 import com.example.ui.theme.VoidObsidian
 import com.example.ui.viewmodel.JarvisViewModel
 import kotlinx.coroutines.delay
@@ -78,9 +68,8 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
     var showVaultSheet by remember { mutableStateOf(false) }
     var showNvidiaApiDialog by remember { mutableStateOf(false) }
     var showVoiceStudio by remember { mutableStateOf(false) }
+    var showSettingsHub by remember { mutableStateOf(false) }
     var biometricError by remember { mutableStateOf<String?>(null) }
-    var pendingImageUri by remember { mutableStateOf<Uri?>(null) }
-    var imagePromptDraft by remember { mutableStateOf("") }
 
     val triggerBiometricUnlock = remember(activity) {
         {
@@ -130,12 +119,19 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
         viewModel.refreshPermissionsAndTelemetry()
     }
 
-    val photoPickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.PickVisualMedia()
+    val wavSamplePickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            pendingImageUri = uri
-            imagePromptDraft = "Analyze this image and tell me what action to take."
+            viewModel.importAetherVoiceSample(uri)
+        }
+    }
+
+    val onnxModelPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.importCustomOnnxModel(uri)
         }
     }
 
@@ -147,12 +143,52 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
         }
     }
 
-    BackHandler(enabled = showPermissionsWizard || showVaultSheet || showNvidiaApiDialog || showVoiceStudio || pendingImageUri != null) {
+    val mediaProjectionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == android.app.Activity.RESULT_OK && data != null) {
+            com.example.service.ScreenVisionService.startWithConsent(
+                context = context,
+                resultCode = result.resultCode,
+                data = data
+            )
+            viewModel.refreshPermissionsAndTelemetry()
+        }
+    }
+
+    val defaultAssistantLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) {
+        viewModel.refreshPermissionsAndTelemetry()
+    }
+
+    val triggerDeepScreenVisionToggle: () -> Unit = {
+        if (uiState.isDeepVisionActive) {
+            viewModel.stopDeepScreenVision()
+        } else {
+            val mgr = context.getSystemService(android.content.Context.MEDIA_PROJECTION_SERVICE)
+                as? android.media.projection.MediaProjectionManager
+            if (mgr != null) {
+                mediaProjectionLauncher.launch(mgr.createScreenCaptureIntent())
+            }
+        }
+    }
+
+    val triggerDefaultAssistantRequest: () -> Unit = {
+        runCatching {
+            defaultAssistantLauncher.launch(
+                viewModel.permissionsManager.buildRequestDefaultAssistantIntent()
+            )
+        }
+    }
+
+    BackHandler(enabled = showSettingsHub || showPermissionsWizard || showVaultSheet || showNvidiaApiDialog || showVoiceStudio) {
         when {
-            pendingImageUri != null -> pendingImageUri = null
             showVoiceStudio -> showVoiceStudio = false
             showNvidiaApiDialog -> showNvidiaApiDialog = false
             showPermissionsWizard -> showPermissionsWizard = false
+            showSettingsHub -> showSettingsHub = false
             showVaultSheet -> showVaultSheet = false
         }
     }
@@ -240,11 +276,6 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
                             }
                         },
                         onSubmitText = { viewModel.submitTextCommand(it) },
-                        onVisualScanClick = {
-                            photoPickerLauncher.launch(
-                                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-                            )
-                        },
                         onToggleBackgroundService = {
                             if (!uiState.permissionSnapshot.micGranted || !uiState.permissionSnapshot.notificationsGranted) {
                                 showPermissionsWizard = true
@@ -253,6 +284,7 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
                             }
                         },
                         onToggleTts = { viewModel.toggleTts() },
+                        onOpenSettings = { showSettingsHub = true },
                         onToggleLiveDuplex = {
                             if (!uiState.permissionSnapshot.micGranted) {
                                 batchPermissionLauncher.launch(
@@ -411,7 +443,32 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
                 onOpenVoiceStudio = {
                     showPermissionsWizard = false
                     showVoiceStudio = true
-                }
+                },
+                onToggleDeepScreenVision = triggerDeepScreenVisionToggle,
+                onRequestDefaultAssistant = triggerDefaultAssistantRequest
+            )
+        }
+
+        if (showSettingsHub) {
+            SettingsHubSheet(
+                uiState = uiState,
+                onDismiss = { showSettingsHub = false },
+                onSelectPersona = { viewModel.selectPersona(it) },
+                onToggleWakeWord = { viewModel.toggleWakeWord() },
+                onUpdateWakeWordPhrase = { viewModel.updateWakeWordPhrase(it) },
+                onTogglePauseWakeDuringMusic = { viewModel.togglePauseWakeDuringMusic() },
+                onToggleBargeIn = { viewModel.toggleBargeIn() },
+                onToggleContinuousLoop = { viewModel.toggleContinuousLoop() },
+                onToggleAutonomousMode = { viewModel.toggleAutonomousMode() },
+                onSelectLocale = { viewModel.setSpeechLocale(it) },
+                onOpenVoiceStudio = { showVoiceStudio = true },
+                onOpenApiSettings = { showNvidiaApiDialog = true },
+                onOpenPermissions = { showPermissionsWizard = true },
+                onSelectWakeTriggerMode = { viewModel.setWakeTriggerMode(it) },
+                onDownloadKwsPack = { viewModel.downloadKwsPack() },
+                onToggleDeepScreenVision = triggerDeepScreenVisionToggle,
+                onRequestDefaultAssistant = triggerDefaultAssistantRequest,
+                onSelectVisionTokenMode = { viewModel.setVisionTokenMode(it) }
             )
         }
 
@@ -421,10 +478,24 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
                 onDismiss = { showVoiceStudio = false },
                 onSelectEngineMode = { viewModel.setVoiceEngineMode(it) },
                 onSelectBargeInMode = { viewModel.setBargeInMode(it) },
+                onToggleFilteredMic = { viewModel.toggleFilteredMicMode() },
                 onDownloadPack = { viewModel.downloadVoicePack(it) },
+                onSelectPackForPersona = { packId, persona ->
+                    viewModel.selectVoicePack(packId, persona)
+                },
                 onSelectPack = { viewModel.selectVoicePack(it) },
                 onDeletePack = { viewModel.deleteVoicePack(it) },
-                onTestSample = { viewModel.testVoiceSample(it) }
+                onTestSample = { viewModel.testVoiceSample(it) },
+                onSetVoiceSpeed = { viewModel.setVoiceSpeed(it) },
+                onImportVoiceSampleClick = {
+                    wavSamplePickerLauncher.launch(arrayOf("audio/*"))
+                },
+                onPreviewImportedSampleClick = {
+                    viewModel.previewImportedAetherSample()
+                },
+                onImportCustomOnnxClick = {
+                    onnxModelPickerLauncher.launch(arrayOf("*/*"))
+                }
             )
         }
 
@@ -433,52 +504,11 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
                 preferences = uiState.preferences,
                 isConfigured = viewModel.isNvidiaConfigured(),
                 onDismiss = { showNvidiaApiDialog = false },
-                onSave = { apiKey, model, preferPrimary ->
-                    viewModel.saveNvidiaSettings(apiKey, model, preferPrimary)
+                onSave = { nvidiaKey, nvidiaModel, preferPrimary, geminiKey, geminiModel ->
+                    viewModel.saveApiSettings(nvidiaKey, nvidiaModel, preferPrimary, geminiKey, geminiModel)
                 },
                 onFetchModels = { overrideKey ->
                     viewModel.fetchLiveNvidiaModels(overrideKey)
-                }
-            )
-        }
-
-        pendingImageUri?.let { uri ->
-            AlertDialog(
-                onDismissRequest = { pendingImageUri = null },
-                containerColor = SmokedGlassElevated,
-                titleContentColor = HudTextPrimary,
-                textContentColor = HudTextPrimary,
-                shape = RoundedCornerShape(20.dp),
-                title = { Text("Visual Scan with Gemini", style = MaterialTheme.typography.titleMedium) },
-                text = {
-                    Column {
-                        Text(
-                            text = "Ask Aether what to read, summarize, or execute from this image:",
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                        Spacer(Modifier.height(8.dp))
-                        OutlinedTextField(
-                            value = imagePromptDraft,
-                            onValueChange = { imagePromptDraft = it },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        onClick = {
-                            viewModel.submitImageCommand(uri, imagePromptDraft)
-                            pendingImageUri = null
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = accent, contentColor = VoidObsidian)
-                    ) {
-                        Text("Analyze")
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { pendingImageUri = null }) {
-                        Text("Cancel", color = HudTextPrimary)
-                    }
                 }
             )
         }

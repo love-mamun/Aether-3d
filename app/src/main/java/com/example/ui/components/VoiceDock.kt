@@ -32,9 +32,9 @@ import androidx.compose.material.icons.automirrored.filled.VolumeOff
 import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.HeadsetMic
-import androidx.compose.material.icons.filled.ImageSearch
 import androidx.compose.material.icons.filled.Keyboard
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -69,11 +69,11 @@ import com.example.ui.theme.VoidObsidian
 import kotlinx.coroutines.flow.StateFlow
 
 private val QuickPrompts = listOf(
-    "See my screen",
-    "Weather here",
-    "Morning Briefing",
     "Flashlight on",
+    "DND on",
+    "Call Ma",
     "Open YouTube",
+    "Weather here",
     "Battery status"
 )
 
@@ -83,9 +83,9 @@ fun VoiceDock(
     audioAmplitudeFlow: StateFlow<Float>,
     onMicClick: () -> Unit,
     onSubmitText: (String) -> Unit,
-    onVisualScanClick: () -> Unit,
     onToggleBackgroundService: () -> Unit,
     onToggleTts: () -> Unit,
+    onOpenSettings: () -> Unit = {},
     onToggleLiveDuplex: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -97,7 +97,7 @@ fun VoiceDock(
         modifier = modifier
             .fillMaxWidth()
             .navigationBarsPadding()
-            .padding(bottom = 10.dp),
+            .padding(bottom = 8.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
         // Live Full-Duplex Active Pill Banner
@@ -137,7 +137,7 @@ fun VoiceDock(
             modifier = Modifier
                 .fillMaxWidth()
                 .horizontalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 6.dp),
+                .padding(horizontal = 14.dp, vertical = 5.dp),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Surface(
@@ -191,13 +191,18 @@ fun VoiceDock(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                    .padding(horizontal = 14.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 OutlinedTextField(
                     value = textInput,
                     onValueChange = { textInput = it },
-                    placeholder = { Text("Command Aether (Bangla / English)...", color = HudTextSecondary) },
+                    placeholder = {
+                        Text(
+                            "Command ${uiState.preferences.persona.displayName} (Bangla / English)...",
+                            color = HudTextSecondary
+                        )
+                    },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                     keyboardActions = KeyboardActions(
@@ -248,35 +253,22 @@ fun VoiceDock(
 
         Spacer(Modifier.height(4.dp))
 
-        // Sculpted Arc Reactor Dock
+        // Sculpted Arc Reactor Dock (Settings cleanly anchored at Bottom-Right corner)
         Surface(
             color = SmokedGlassElevated,
-            shape = RoundedCornerShape(32.dp),
+            shape = RoundedCornerShape(30.dp),
             border = BorderStroke(1.dp, accent.copy(alpha = 0.4f)),
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp)
+                .padding(horizontal = 14.dp)
         ) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(
-                    onClick = onVisualScanClick,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .testTag("visual_scan_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.ImageSearch,
-                        contentDescription = "Visual Scan Photo Picker",
-                        tint = HudTextPrimary
-                    )
-                }
-
                 IconButton(
                     onClick = { showTextBar = !showTextBar },
                     modifier = Modifier
@@ -287,6 +279,23 @@ fun VoiceDock(
                         imageVector = Icons.Filled.Keyboard,
                         contentDescription = "Toggle text command input",
                         tint = if (showTextBar) accent else HudTextSecondary
+                    )
+                }
+
+                IconButton(
+                    onClick = onToggleTts,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("tts_toggle_button")
+                ) {
+                    Icon(
+                        imageVector = if (uiState.preferences.ttsEnabled) {
+                            Icons.AutoMirrored.Filled.VolumeUp
+                        } else {
+                            Icons.AutoMirrored.Filled.VolumeOff
+                        },
+                        contentDescription = "Toggle spoken responses",
+                        tint = if (uiState.preferences.ttsEnabled) accent else HudTextSecondary
                     )
                 }
 
@@ -301,7 +310,7 @@ fun VoiceDock(
                 }
                 Box(
                     contentAlignment = Alignment.Center,
-                    modifier = Modifier.size(72.dp)
+                    modifier = Modifier.size(68.dp)
                 ) {
                     if (isListening || uiState.isWakeWordArmed) {
                         MicPulseHalo(
@@ -314,7 +323,7 @@ fun VoiceDock(
                         shape = CircleShape,
                         border = BorderStroke(2.dp, micBorderColor),
                         modifier = Modifier
-                            .size(58.dp)
+                            .size(56.dp)
                             .testTag("mic_button")
                             .clickable(onClick = onMicClick)
                     ) {
@@ -327,7 +336,7 @@ fun VoiceDock(
                                     else -> "Start voice command"
                                 },
                                 tint = if (isListening) VoidObsidian else micBorderColor,
-                                modifier = Modifier.size(28.dp)
+                                modifier = Modifier.size(26.dp)
                             )
                         }
                     }
@@ -347,19 +356,15 @@ fun VoiceDock(
                 }
 
                 IconButton(
-                    onClick = onToggleTts,
+                    onClick = onOpenSettings,
                     modifier = Modifier
                         .size(48.dp)
-                        .testTag("tts_toggle_button")
+                        .testTag("bottom_settings_button")
                 ) {
                     Icon(
-                        imageVector = if (uiState.preferences.ttsEnabled) {
-                            Icons.AutoMirrored.Filled.VolumeUp
-                        } else {
-                            Icons.AutoMirrored.Filled.VolumeOff
-                        },
-                        contentDescription = "Toggle spoken responses",
-                        tint = if (uiState.preferences.ttsEnabled) accent else HudTextSecondary
+                        imageVector = Icons.Filled.Settings,
+                        contentDescription = "Open Settings",
+                        tint = accent
                     )
                 }
             }
