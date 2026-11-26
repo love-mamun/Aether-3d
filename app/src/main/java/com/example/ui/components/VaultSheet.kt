@@ -18,6 +18,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material.icons.filled.Contacts
@@ -63,6 +64,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.example.data.local.AppPlaybookEntity
 import com.example.data.local.CommandLogEntity
 import com.example.data.local.MemoryNoteEntity
 import com.example.data.local.QuickContactEntity
@@ -123,7 +125,11 @@ fun VaultBottomSheet(
     macroStepCount: Int = 0,
     onToggleMacroRecording: (String) -> Unit = {},
     onReplayMacro: (ScreenMacroEntity) -> Unit = {},
-    onDeleteMacro: (Long) -> Unit = {}
+    onDeleteMacro: (Long) -> Unit = {},
+    playbooks: List<AppPlaybookEntity> = emptyList(),
+    onTogglePlaybookPinned: (AppPlaybookEntity) -> Unit = {},
+    onReplayPlaybook: (AppPlaybookEntity) -> Unit = {},
+    onDeletePlaybook: (Long) -> Unit = {}
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
@@ -185,6 +191,13 @@ fun VaultBottomSheet(
                 onDismiss()
             },
             onDeleteMacro = onDeleteMacro,
+            playbooks = playbooks,
+            onTogglePlaybookPinned = onTogglePlaybookPinned,
+            onReplayPlaybook = {
+                onReplayPlaybook(it)
+                onDismiss()
+            },
+            onDeletePlaybook = onDeletePlaybook,
             modifier = Modifier
                 .fillMaxWidth()
                 .fillMaxHeight(0.84f)
@@ -235,11 +248,15 @@ fun VaultWorkspaceContent(
     macroStepCount: Int = 0,
     onToggleMacroRecording: (String) -> Unit = {},
     onReplayMacro: (ScreenMacroEntity) -> Unit = {},
-    onDeleteMacro: (Long) -> Unit = {}
+    onDeleteMacro: (Long) -> Unit = {},
+    playbooks: List<AppPlaybookEntity> = emptyList(),
+    onTogglePlaybookPinned: (AppPlaybookEntity) -> Unit = {},
+    onReplayPlaybook: (AppPlaybookEntity) -> Unit = {},
+    onDeletePlaybook: (Long) -> Unit = {}
 ) {
     val accent = MaterialTheme.colorScheme.primary
     var selectedTab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("History", "Memories", "Routines", "Contacts", "Briefing", "Macros")
+    val tabs = listOf("History", "Memories", "Routines", "Contacts", "Briefing", "Macros", "Playbooks")
     val isLocked = biometricLockEnabled && !isVaultUnlocked
 
     Column(modifier = modifier.padding(horizontal = 16.dp)) {
@@ -405,6 +422,13 @@ fun VaultWorkspaceContent(
                 onToggleRecording = onToggleMacroRecording,
                 onReplayMacro = onReplayMacro,
                 onDeleteMacro = onDeleteMacro
+            )
+            6 -> PlaybooksTab(
+                playbooks = playbooks,
+                accent = accent,
+                onTogglePin = onTogglePlaybookPinned,
+                onReplay = onReplayPlaybook,
+                onDelete = onDeletePlaybook
             )
         }
     }
@@ -1094,6 +1118,82 @@ private fun MacrosTab(
                             }
                             IconButton(onClick = { onDeleteMacro(macro.id) }) {
                                 Icon(Icons.Filled.DeleteOutline, contentDescription = "Delete macro", tint = AlertCoral)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlaybooksTab(
+    playbooks: List<AppPlaybookEntity>,
+    accent: androidx.compose.ui.graphics.Color,
+    onTogglePin: (AppPlaybookEntity) -> Unit,
+    onReplay: (AppPlaybookEntity) -> Unit,
+    onDelete: (Long) -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text = "Self-learned accessibility UI playbooks bypass cloud planning on repeat flows.",
+            style = MaterialTheme.typography.bodySmall,
+            color = HudTextSecondary
+        )
+        Spacer(Modifier.height(8.dp))
+        if (playbooks.isEmpty()) {
+            EmptyVaultHint(
+                icon = Icons.Filled.AutoAwesome,
+                message = "No learned playbooks yet. Run a multi-step Facebook/WhatsApp task once and Aether will learn it automatically."
+            )
+        } else {
+            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(playbooks, key = { it.id }) { pb ->
+                    Surface(
+                        color = SmokedGlass,
+                        shape = RoundedCornerShape(14.dp),
+                        border = BorderStroke(1.dp, accent.copy(alpha = 0.28f)),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("playbook_card_${pb.id}")
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "${pb.appLabel.ifBlank { "App Flow" }} · ${pb.intentPattern}",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = accent
+                                )
+                                Text(
+                                    text = "Success: ${pb.successCount} · Avg: ${pb.avgDurationMs}ms · Slots: ${pb.variableKeysJson}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = HudTextSecondary
+                                )
+                            }
+                            IconButton(onClick = { onTogglePin(pb) }) {
+                                Icon(
+                                    imageVector = if (pb.isPinned) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
+                                    contentDescription = "Pin playbook",
+                                    tint = accent
+                                )
+                            }
+                            IconButton(onClick = { onReplay(pb) }) {
+                                Icon(
+                                    imageVector = Icons.Filled.PlayArrow,
+                                    contentDescription = "Replay playbook",
+                                    tint = StealthEmerald
+                                )
+                            }
+                            IconButton(onClick = { onDelete(pb.id) }) {
+                                Icon(
+                                    imageVector = Icons.Filled.DeleteOutline,
+                                    contentDescription = "Delete playbook",
+                                    tint = AlertCoral
+                                )
                             }
                         }
                     }

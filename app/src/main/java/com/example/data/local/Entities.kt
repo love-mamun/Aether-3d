@@ -67,3 +67,33 @@ data class ScreenMacroEntity(
     val lastRunAt: Long = 0L,
     val createdAt: Long = System.currentTimeMillis()
 )
+
+@Entity(tableName = "app_playbooks")
+data class AppPlaybookEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val appPackage: String,
+    val appLabel: String,
+    val intentPattern: String,
+    val variableKeysJson: String = "[]",
+    val stepsJson: String,
+    val successCount: Int = 1,
+    val failureCount: Int = 0,
+    val avgDurationMs: Long = 0L,
+    val isPinned: Boolean = false,
+    val lastUsedAt: Long = System.currentTimeMillis(),
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+@Entity(tableName = "smart_trigger_rules")
+data class SmartTriggerRuleEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val name: String,
+    val triggerType: String, // BLUETOOTH_CONNECTED | WIFI_CONNECTED | BATTERY_LOW | CHARGER_CONNECTED
+    val conditionValue: String = "",
+    val actionMode: String = "SPEAK_NOTIFICATION_DIGEST", // SPEAK_NOTIFICATION_DIGEST | RUN_PROMPT_COMMAND
+    val actionPayload: String = "",
+    val cooldownMinutes: Int = 15,
+    val isEnabled: Boolean = false,
+    val lastTriggeredAt: Long = 0L,
+    val createdAt: Long = System.currentTimeMillis()
+)

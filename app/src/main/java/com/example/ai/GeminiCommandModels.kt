@@ -87,7 +87,10 @@ enum class ActionType {
     UI_TAP_COORDINATES,
     UI_INPUT_TEXT,
     UI_SCROLL,
-    GLOBAL_ACTION
+    GLOBAL_ACTION,
+    READ_NOTIFICATIONS,
+    REPLY_NOTIFICATION,
+    OPEN_CAMERA_LENS
 }
 
 enum class TaskStatus {

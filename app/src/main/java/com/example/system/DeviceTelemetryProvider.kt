@@ -278,13 +278,17 @@ class DeviceTelemetryProvider(private val context: Context) {
         val clean = query.trim().lowercase(Locale.US)
         if (clean.isBlank()) return null
         val map = queryLauncherAppMap().ifEmpty { queryLauncherAppMap(forceRefresh = true) }
+        val wantsLite = clean.contains("lite")
         val aliasKeywords = when (clean) {
             "fb" -> listOf("facebook")
+            "fb lite", "facebook lite" -> listOf("facebook lite", "lite")
             "yt" -> listOf("youtube")
             "wa" -> listOf("whatsapp")
+            "messenger lite" -> listOf("messenger lite", "mlite")
             "dial", "dialer", "phone", "call" -> listOf("dial", "phone", "contacts", "truecaller", "call")
             else -> listOf(clean)
         }
+        val queryTokens = clean.split(Regex("\\s+")).filter { it.isNotBlank() }
 
         val scored = map.entries.mapNotNull { (label, pkg) ->
             val lLower = label.lowercase(Locale.US)
@@ -292,13 +296,25 @@ class DeviceTelemetryProvider(private val context: Context) {
             var score = 0
             for (kw in aliasKeywords) {
                 when {
-                    lLower == kw -> score = maxOf(score, 200)
-                    lLower.startsWith("$kw ") || lLower.startsWith(kw) -> score = maxOf(score, 140)
-                    Regex("\\b${Regex.escape(kw)}\\b").containsMatchIn(lLower) -> score = maxOf(score, 120)
-                    lLower.contains(kw) -> score = maxOf(score, 90)
-                    pLower.substringAfterLast('.') == kw -> score = maxOf(score, 105)
-                    pLower.contains(kw) -> score = maxOf(score, 65)
+                    lLower == kw -> score = maxOf(score, 240)
+                    lLower.startsWith("$kw ") || lLower.startsWith(kw) -> score = maxOf(score, 155)
+                    Regex("\\b${Regex.escape(kw)}\\b").containsMatchIn(lLower) -> score = maxOf(score, 130)
+                    lLower.contains(kw) -> score = maxOf(score, 95)
+                    pLower.substringAfterLast('.') == kw -> score = maxOf(score, 115)
+                    pLower.contains(kw) -> score = maxOf(score, 70)
                 }
+            }
+            if (queryTokens.size >= 2 && queryTokens.all { tok -> lLower.contains(tok) || pLower.contains(tok) }) {
+                score += 90
+            }
+            val candidateIsLite = lLower.contains("lite") ||
+                pLower.endsWith(".lite") ||
+                pLower.contains(".mlite") ||
+                pLower.contains("fblite")
+            if (score > 0) {
+                if (wantsLite && candidateIsLite) score += 180
+                if (wantsLite && !candidateIsLite) score -= 90
+                if (!wantsLite && candidateIsLite) score -= 75
             }
             if (score > 0) (label to pkg) to score else null
         }

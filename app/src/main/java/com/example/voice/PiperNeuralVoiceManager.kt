@@ -182,14 +182,14 @@ class PiperNeuralVoiceManager(context: Context) {
     val catalog: List<NeuralVoicePack> = listOf(
         NeuralVoicePack(
             id = BUNDLED_STARTER_VOICE_ID,
-            displayName = "Amy Neural · Bundled Offline Starter",
+            displayName = "Amy Neural (English Female · Download)",
             languageTag = "en-US",
             genderHint = "Female",
             downloadSizeMb = 20.1f,
             downloadUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-en_US-amy-low-int8.tar.bz2",
             extractedFolderName = "vits-piper-en_US-amy-low-int8",
-            isBundledAsset = true,
-            bundledAssetPath = "voices/vits-piper-en_US-amy-low-int8.tar.bz2"
+            isBundledAsset = false,
+            bundledAssetPath = null
         ),
         NeuralVoicePack(
             id = "en_US-lessac-medium-int8",
@@ -249,24 +249,31 @@ class PiperNeuralVoiceManager(context: Context) {
 
     init {
         refreshInstalledStates()
-        backgroundScope.launch {
-            ensureBundledStarterInstalled()
-        }
     }
 
     private fun detectInitialEngineLabel(): String {
         val supported = runCatching {
             Build.SUPPORTED_ABIS.any { it.contains("arm64", ignoreCase = true) }
         }.getOrDefault(false)
-        return if (supported) {
-            "Piper Native Neural (ARM64 Ready)"
-        } else {
-            "System Fallback (${Build.SUPPORTED_ABIS.firstOrNull() ?: "emulator"})"
+        val installedCount = catalog.count { isPackInstalled(it) }
+        return when {
+            !supported -> "System TTS (${Build.SUPPORTED_ABIS.firstOrNull() ?: "emulator"})"
+            installedCount > 0 -> "Piper Neural ($installedCount pack${if (installedCount > 1) "s" else ""}) + System TTS"
+            else -> "System TTS Active · Neural Packs In-App"
         }
     }
 
     fun isNativeRuntimeLikelySupported(): Boolean = !nativeBinaryUnavailable &&
         Build.SUPPORTED_ABIS.any { it.contains("arm64", ignoreCase = true) }
+
+    fun computeInstalledDiskMb(): Float {
+        return catalog.filter { isPackInstalled(it) }
+            .sumOf { pack ->
+                val dir = packDir(pack)
+                val bytes = dir.walkTopDown().filter { it.isFile }.sumOf { it.length() }
+                bytes.toDouble()
+            }.toFloat() / (1024f * 1024f)
+    }
 
     fun refreshInstalledStates() {
         _packStates.value = catalog.map { pack ->
@@ -277,6 +284,7 @@ class PiperNeuralVoiceManager(context: Context) {
                 progressPercent = if (ready) 100 else 0
             )
         }
+        _engineStatusLabel.value = detectInitialEngineLabel()
     }
 
     suspend fun ensureBundledStarterInstalled(): Boolean {
@@ -512,14 +520,15 @@ class PiperNeuralVoiceManager(context: Context) {
                 appContext.contentResolver.openInputStream(uri)?.use { input ->
                     FileOutputStream(outOnnx).use { output -> input.copyTo(output) }
                 } ?: throw IllegalStateException("Cannot read .onnx model file.")
-                // Copy starter tokens.txt as fallback vocabulary if user didn't bundle one yet
+                // Copy tokens.txt from any installed pack as fallback vocabulary if user didn't bundle one yet
                 if (findTokensFile(targetDir) == null) {
-                    val starterPack = catalog.firstOrNull { it.id == BUNDLED_STARTER_VOICE_ID }
-                    val starterTokens = starterPack?.let { findTokensFile(packDir(it)) }
-                    if (starterTokens != null) {
-                        starterTokens.copyTo(File(targetDir, "tokens.txt"), overwrite = true)
+                    val fallbackTokens = catalog
+                        .sortedByDescending { it.id == BUNDLED_STARTER_VOICE_ID }
+                        .firstNotNullOfOrNull { candidate -> findTokensFile(packDir(candidate)) }
+                    if (fallbackTokens != null) {
+                        fallbackTokens.copyTo(File(targetDir, "tokens.txt"), overwrite = true)
                     } else {
-                        throw IllegalStateException("Please import a Piper .tar.bz2 pack containing tokens.txt")
+                        throw IllegalStateException("Please download a Piper voice pack or import paired tokens.txt first.")
                     }
                 }
             } else if (lowerName == "tokens.txt") {

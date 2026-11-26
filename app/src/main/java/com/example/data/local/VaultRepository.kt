@@ -90,7 +90,8 @@ data class AssistantPreferences(
     val briefingMinute: Int = 0,
     val filteredMicEnabled: Boolean = true,
     val visionTokenMode: VisionTokenMode = VisionTokenMode.OFFLINE_FIRST,
-    val estimatedTokensSavedTotal: Long = 0L
+    val estimatedTokensSavedTotal: Long = 0L,
+    val autoZeroMicOnDefaultAssistant: Boolean = true
 ) {
     fun voiceIdForPersona(target: AssistantPersona = persona): String {
         return when (target) {
@@ -114,6 +115,8 @@ class VaultRepository(context: Context) {
     private val quickContactDao = db.quickContactDao()
     private val reminderDao = db.reminderDao()
     private val screenMacroDao = db.screenMacroDao()
+    private val appPlaybookDao = db.appPlaybookDao()
+    private val smartTriggerRuleDao = db.smartTriggerRuleDao()
 
     private val prefs = context.applicationContext.getSharedPreferences(
         "aether_3d_prefs",
@@ -129,6 +132,8 @@ class VaultRepository(context: Context) {
     val allContacts: Flow<List<QuickContactEntity>> = quickContactDao.observeAllContacts()
     val allReminders: Flow<List<ReminderEntity>> = reminderDao.observeAllReminders()
     val allMacros: Flow<List<ScreenMacroEntity>> = screenMacroDao.observeAllMacros()
+    val allPlaybooks: Flow<List<AppPlaybookEntity>> = appPlaybookDao.observeAllPlaybooks()
+    val allTriggerRules: Flow<List<SmartTriggerRuleEntity>> = smartTriggerRuleDao.observeAllRules()
 
     suspend fun insertLog(log: CommandLogEntity): Long = commandLogDao.insertLog(log)
     suspend fun getRecentLogsSnapshot(limit: Int = 20): List<CommandLogEntity> = commandLogDao.getRecentLogsSnapshot(limit)
@@ -175,6 +180,21 @@ class VaultRepository(context: Context) {
     suspend fun saveMacro(macro: ScreenMacroEntity): Long = screenMacroDao.insertMacro(macro)
     suspend fun recordMacroRun(id: Long) = screenMacroDao.recordMacroRun(id)
     suspend fun deleteMacro(id: Long) = screenMacroDao.deleteMacroById(id)
+
+    suspend fun getPlaybooksSnapshot(): List<AppPlaybookEntity> = appPlaybookDao.getAllPlaybooksSnapshot()
+    suspend fun savePlaybook(playbook: AppPlaybookEntity): Long = appPlaybookDao.insertPlaybook(playbook)
+    suspend fun recordPlaybookSuccess(id: Long, durationMs: Long) =
+        appPlaybookDao.recordPlaybookSuccess(id, durationMs)
+    suspend fun recordPlaybookFailure(id: Long) = appPlaybookDao.recordPlaybookFailure(id)
+    suspend fun togglePlaybookPinned(id: Long, pinned: Boolean) = appPlaybookDao.setPinned(id, pinned)
+    suspend fun deletePlaybook(id: Long) = appPlaybookDao.deletePlaybookById(id)
+
+    suspend fun getTriggerRulesSnapshot(): List<SmartTriggerRuleEntity> = smartTriggerRuleDao.getAllRulesSnapshot()
+    suspend fun saveTriggerRule(rule: SmartTriggerRuleEntity): Long = smartTriggerRuleDao.insertRule(rule)
+    suspend fun setTriggerRuleEnabled(id: Long, enabled: Boolean) = smartTriggerRuleDao.setEnabled(id, enabled)
+    suspend fun recordTriggerFired(id: Long, atMs: Long = System.currentTimeMillis()) =
+        smartTriggerRuleDao.recordTriggered(id, atMs)
+    suspend fun deleteTriggerRule(id: Long) = smartTriggerRuleDao.deleteRuleById(id)
 
     fun loadPreferences(): AssistantPreferences {
         val personaName = prefs.getString("persona", AssistantPersona.AETHER.name)
@@ -253,7 +273,8 @@ class VaultRepository(context: Context) {
             visionTokenMode = VisionTokenMode.fromStoredName(
                 prefs.getString("vision_token_mode", VisionTokenMode.OFFLINE_FIRST.name)
             ),
-            estimatedTokensSavedTotal = prefs.getLong("estimated_tokens_saved_total", 0L).coerceAtLeast(0L)
+            estimatedTokensSavedTotal = prefs.getLong("estimated_tokens_saved_total", 0L).coerceAtLeast(0L),
+            autoZeroMicOnDefaultAssistant = prefs.getBoolean("auto_zero_mic_default_assist", true)
         )
     }
 
@@ -300,6 +321,7 @@ class VaultRepository(context: Context) {
             .putBoolean("filtered_mic_enabled", updated.filteredMicEnabled)
             .putString("vision_token_mode", updated.visionTokenMode.name)
             .putLong("estimated_tokens_saved_total", updated.estimatedTokensSavedTotal.coerceAtLeast(0L))
+            .putBoolean("auto_zero_mic_default_assist", updated.autoZeroMicOnDefaultAssistant)
             .apply()
     }
 }

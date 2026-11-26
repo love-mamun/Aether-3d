@@ -277,7 +277,9 @@ class FloatingOrbOverlay(
                     if (abs(dx) > 10 || abs(dy) > 10) moved = true
                     params.x = startX + dx
                     params.y = startY + dy
-                    runCatching { windowManager.updateViewLayout(container, params) }
+                    if (isShowing && container.isAttachedToWindow) {
+                        runCatching { windowManager.updateViewLayout(container, params) }
+                    }
                     true
                 }
                 MotionEvent.ACTION_UP -> {
@@ -289,22 +291,27 @@ class FloatingOrbOverlay(
                         } else {
                             edgeMargin
                         }
-                        ValueAnimator.ofInt(params.x, targetEdgeX).apply {
+                        snapAnimator?.cancel()
+                        snapAnimator = ValueAnimator.ofInt(params.x, targetEdgeX).apply {
                             duration = 280L
                             interpolator = OvershootInterpolator(1.05f)
                             addUpdateListener { anim ->
                                 params.x = anim.animatedValue as Int
-                                runCatching { windowManager.updateViewLayout(container, params) }
+                                if (isShowing && container.isAttachedToWindow) {
+                                    runCatching { windowManager.updateViewLayout(container, params) }
+                                }
                             }
                             start()
                         }
                         if (!drawerExpanded) container.alpha = 0.72f
                     } else if (heldMs > 550L) {
-                        context.startActivity(
-                            Intent(context, MainActivity::class.java).addFlags(
-                                Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        runCatching {
+                            context.startActivity(
+                                Intent(context, MainActivity::class.java).addFlags(
+                                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                                )
                             )
-                        )
+                        }
                     } else {
                         val now = System.currentTimeMillis()
                         if (now - lastTapUpTime < 280L) {
@@ -358,6 +365,7 @@ class FloatingOrbOverlay(
     ) {
         if (!isShowing) return
         mainHandler.post {
+            if (!isShowing) return@post
             orbView?.setVisualState(coreMode, persona, isMacroRecording)
             val displayMessage = when {
                 isWaitingForLoad -> "⏳ Waiting for screen to load… ${message.take(45)}"
@@ -384,12 +392,18 @@ class FloatingOrbOverlay(
     }
 
     fun hide() {
-        if (!isShowing) return
+        mainHandler.removeCallbacksAndMessages(null)
+        singleTapRunnable = null
+        snapAnimator?.cancel()
+        snapAnimator = null
         mainHandler.post {
-            singleTapRunnable?.let { mainHandler.removeCallbacks(it) }
-            singleTapRunnable = null
             orbView?.stopAnimation()
-            rootLayout?.let { runCatching { windowManager.removeView(it) } }
+            rootLayout?.let { view ->
+                if (view.isAttachedToWindow) {
+                    runCatching { windowManager.removeViewImmediate(view) }
+                        .onFailure { runCatching { windowManager.removeView(view) } }
+                }
+            }
             rootLayout = null
             orbView = null
             contentColumn = null
@@ -404,6 +418,8 @@ class FloatingOrbOverlay(
         }
     }
 
+    private var snapAnimator: ValueAnimator? = null
+
     private class HolographicOrbView(context: Context) : View(context) {
         private val outerRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             style = Paint.Style.STROKE
@@ -411,6 +427,7 @@ class FloatingOrbOverlay(
             color = Color.CYAN
         }
         private val portraitPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+        private val shaderMatrix = android.graphics.Matrix()
 
         private var accentColor: Int = 0xFF00E5FF.toInt()
         private var currentPersona: AssistantPersona = AssistantPersona.AETHER
@@ -428,8 +445,17 @@ class FloatingOrbOverlay(
             }
         }
 
+        override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+            super.onSizeChanged(w, h, oldw, oldh)
+            preparePortraitShader()
+        }
+
         fun setVisualState(mode: CoreMode, persona: AssistantPersona, isMacroRecording: Boolean) {
+            val personaChanged = currentPersona != persona
             currentPersona = persona
+            if (personaChanged || portraitPaint.shader == null) {
+                preparePortraitShader()
+            }
             accentColor = when {
                 isMacroRecording -> 0xFFFF1744.toInt()
                 mode == CoreMode.ERROR -> 0xFFFF5252.toInt()
@@ -456,27 +482,35 @@ class FloatingOrbOverlay(
             removeCallbacks(frameRunnable)
         }
 
-        private fun ensurePortraitShader(cx: Float, cy: Float, innerRadius: Float) {
+        private fun preparePortraitShader() {
+            if (width <= 0 || height <= 0) return
+            val cx = width * 0.5f
+            val cy = height * 0.5f
+            val innerRadius = minOf(width, height) * 0.44f * 0.85f
             val diameter = (innerRadius * 2f).toInt().coerceAtLeast(16)
             if (cachedBitmapPersona == currentPersona && abs(cachedShaderRadius - innerRadius) < 1f && portraitPaint.shader != null) {
                 return
             }
-            val resId = com.example.ui.components.avatarDrawableFor(currentPersona)
-            val raw = android.graphics.BitmapFactory.decodeResource(resources, resId) ?: return
-            val scaled = android.graphics.Bitmap.createScaledBitmap(raw, diameter, diameter, true)
-            if (scaled !== raw) raw.recycle()
-            val shader = android.graphics.BitmapShader(
-                scaled,
-                android.graphics.Shader.TileMode.CLAMP,
-                android.graphics.Shader.TileMode.CLAMP
-            )
-            val matrix = android.graphics.Matrix().apply {
-                setTranslate(cx - innerRadius, cy - innerRadius)
+            runCatching {
+                val resId = com.example.ui.components.avatarDrawableFor(currentPersona)
+                val opts = android.graphics.BitmapFactory.Options().apply {
+                    inPreferredConfig = android.graphics.Bitmap.Config.RGB_565
+                }
+                val raw = android.graphics.BitmapFactory.decodeResource(resources, resId, opts) ?: return
+                val scaled = android.graphics.Bitmap.createScaledBitmap(raw, diameter, diameter, true)
+                if (scaled !== raw) raw.recycle()
+                val shader = android.graphics.BitmapShader(
+                    scaled,
+                    android.graphics.Shader.TileMode.CLAMP,
+                    android.graphics.Shader.TileMode.CLAMP
+                )
+                shaderMatrix.reset()
+                shaderMatrix.setTranslate(cx - innerRadius, cy - innerRadius)
+                shader.setLocalMatrix(shaderMatrix)
+                portraitPaint.shader = shader
+                cachedBitmapPersona = currentPersona
+                cachedShaderRadius = innerRadius
             }
-            shader.setLocalMatrix(matrix)
-            portraitPaint.shader = shader
-            cachedBitmapPersona = currentPersona
-            cachedShaderRadius = innerRadius
         }
 
         override fun onDraw(canvas: Canvas) {
@@ -491,7 +525,6 @@ class FloatingOrbOverlay(
             canvas.drawCircle(cx, cy, baseR * pulse, outerRingPaint)
 
             val innerR = baseR * 0.85f
-            ensurePortraitShader(cx, cy, innerR)
             if (portraitPaint.shader != null) {
                 canvas.drawCircle(cx, cy, innerR, portraitPaint)
             }

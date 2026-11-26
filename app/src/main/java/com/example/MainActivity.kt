@@ -27,6 +27,9 @@ class MainActivity : FragmentActivity() {
 
         // STEP 1: Configure Firebase App Check with launch intent before any UI or ViewModel creation
         configureAppCheck(this, intent)
+        if (isExternalVoiceIntent(intent)) {
+            com.example.core.AgentOrchestrator.getInstance(applicationContext).prepareExternalVoiceTrigger()
+        }
         pendingLaunchIntent = intent
 
         enableEdgeToEdge()
@@ -38,9 +41,7 @@ class MainActivity : FragmentActivity() {
                 val incoming = pendingLaunchIntent ?: return@LaunchedEffect
                 val triggerBriefing = incoming.getBooleanExtra(BriefingWorker.EXTRA_TRIGGER_BRIEFING, false)
                 val reminderTitle = incoming.getStringExtra(BriefingWorker.EXTRA_REMINDER_TITLE).orEmpty()
-                val triggerVoice = incoming.action == Intent.ACTION_ASSIST ||
-                    incoming.action == AetherVoiceTileService.ACTION_TRIGGER_AETHER_VOICE ||
-                    incoming.getBooleanExtra(AetherVoiceTileService.EXTRA_START_VOICE_IMMEDIATELY, false)
+                val triggerVoice = isExternalVoiceIntent(incoming)
 
                 if (triggerBriefing || reminderTitle.isNotBlank()) {
                     incoming.removeExtra(BriefingWorker.EXTRA_TRIGGER_BRIEFING)
@@ -65,6 +66,16 @@ class MainActivity : FragmentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         configureAppCheck(this, intent)
+        if (isExternalVoiceIntent(intent)) {
+            com.example.core.AgentOrchestrator.getInstance(applicationContext).prepareExternalVoiceTrigger()
+        }
         pendingLaunchIntent = intent
+    }
+
+    private fun isExternalVoiceIntent(incoming: Intent?): Boolean {
+        if (incoming == null) return false
+        return incoming.action == Intent.ACTION_ASSIST ||
+            incoming.action == AetherVoiceTileService.ACTION_TRIGGER_AETHER_VOICE ||
+            incoming.getBooleanExtra(AetherVoiceTileService.EXTRA_START_VOICE_IMMEDIATELY, false)
     }
 }

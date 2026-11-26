@@ -11,11 +11,13 @@ import com.example.ai.CoreMode
 import com.example.ai.SpeechLocaleOption
 import com.example.core.AgentOrchestrator
 import com.example.core.AssistantUiState
+import com.example.data.local.AppPlaybookEntity
 import com.example.data.local.CommandLogEntity
 import com.example.data.local.MemoryNoteEntity
 import com.example.data.local.QuickContactEntity
 import com.example.data.local.ReminderEntity
 import com.example.data.local.ScreenMacroEntity
+import com.example.data.local.SmartTriggerRuleEntity
 import com.example.data.local.VisionTokenMode
 import com.example.data.local.VoiceRoutineEntity
 import com.example.data.local.WakeTriggerMode
@@ -36,6 +38,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     val uiState: StateFlow<AssistantUiState> = orchestrator.uiState
     val audioAmplitude: StateFlow<Float> = orchestrator.audioAmplitude
     val permissionsManager = orchestrator.permissionsManager
+    val cameraLensEngine = orchestrator.cameraLensEngine
 
     val historyLogs: StateFlow<List<CommandLogEntity>> = vault.recentLogs
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -53,6 +56,12 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val macros: StateFlow<List<ScreenMacroEntity>> = vault.allMacros
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val playbooks: StateFlow<List<AppPlaybookEntity>> = vault.allPlaybooks
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val triggerRules: StateFlow<List<SmartTriggerRuleEntity>> = vault.allTriggerRules
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     fun refreshPermissionsAndTelemetry() {
@@ -150,6 +159,7 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     fun startVoiceFromExternalTrigger() {
+        orchestrator.prepareExternalVoiceTrigger()
         val snapshot = permissionsManager.checkSnapshot()
         if (!snapshot.micGranted) {
             refreshPermissionsAndTelemetry()
@@ -226,6 +236,78 @@ class JarvisViewModel(application: Application) : AndroidViewModel(application) 
     fun replayMacro(macro: ScreenMacroEntity) = orchestrator.replayMacro(macro)
 
     fun deleteMacro(id: Long) = orchestrator.deleteMacro(id)
+
+    // Notification Copilot
+    fun speakNotificationDigest() = orchestrator.speakNotificationDigest()
+
+    fun replyToNotification(clusterId: String, replyText: String) =
+        orchestrator.replyToNotificationCluster(clusterId, replyText)
+
+    fun dismissNotification(clusterId: String) =
+        orchestrator.dismissNotificationCluster(clusterId)
+
+    fun clearAllNotifications() = orchestrator.clearAllNotifications()
+
+    // CameraX Live Vision Lens
+    fun analyzeCameraLensBitmap(bitmap: Bitmap, question: String) =
+        orchestrator.analyzeCameraLensFrame(bitmap, question)
+
+    fun analyzeCameraLensUri(uri: Uri, question: String) {
+        viewModelScope.launch {
+            val bitmap = decodeDownscaledBitmap(uri)
+            if (bitmap != null) {
+                orchestrator.analyzeCameraLensFrame(bitmap, question)
+            }
+        }
+    }
+
+    fun clearCameraLensRequest() = orchestrator.clearCameraLensRequest()
+
+    // App Playbooks
+    fun togglePlaybookPinned(playbook: AppPlaybookEntity) {
+        viewModelScope.launch { vault.togglePlaybookPinned(playbook.id, !playbook.isPinned) }
+    }
+
+    fun replayPlaybook(playbook: AppPlaybookEntity) = orchestrator.replayPlaybook(playbook)
+
+    fun deletePlaybook(id: Long) {
+        viewModelScope.launch { vault.deletePlaybook(id) }
+    }
+
+    // Smart Context Auto-Triggers
+    fun toggleTriggerRule(id: Long, enabled: Boolean) {
+        viewModelScope.launch { vault.setTriggerRuleEnabled(id, enabled) }
+    }
+
+    fun addTriggerRule(
+        name: String,
+        triggerType: String,
+        conditionValue: String,
+        actionMode: String,
+        actionPayload: String,
+        cooldownMinutes: Int = 15
+    ) {
+        if (name.isBlank()) return
+        viewModelScope.launch {
+            vault.saveTriggerRule(
+                SmartTriggerRuleEntity(
+                    name = name.trim(),
+                    triggerType = triggerType,
+                    conditionValue = conditionValue.trim(),
+                    actionMode = actionMode,
+                    actionPayload = actionPayload.trim(),
+                    cooldownMinutes = cooldownMinutes.coerceIn(1, 180),
+                    isEnabled = true
+                )
+            )
+        }
+    }
+
+    fun testTriggerRule(rule: SmartTriggerRuleEntity) = orchestrator.testTriggerRuleNow(rule)
+
+    fun deleteTriggerRule(id: Long) {
+        viewModelScope.launch { vault.deleteTriggerRule(id) }
+    }
 
     fun toggleBiometricVaultLock() {
         val next = !uiState.value.preferences.biometricVaultLockEnabled

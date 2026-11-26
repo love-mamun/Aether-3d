@@ -31,7 +31,9 @@ data class PermissionSnapshot(
     val overlayGranted: Boolean = false,
     val writeSettingsGranted: Boolean = false,
     val dndAccessGranted: Boolean = false,
-    val batteryUnrestricted: Boolean = false
+    val batteryUnrestricted: Boolean = false,
+    val notificationAccessGranted: Boolean = false,
+    val bluetoothConnectGranted: Boolean = false
 ) {
     val grantedCount: Int
         get() = listOf(
@@ -45,10 +47,12 @@ data class PermissionSnapshot(
             overlayGranted,
             writeSettingsGranted,
             dndAccessGranted,
-            batteryUnrestricted
+            batteryUnrestricted,
+            notificationAccessGranted,
+            bluetoothConnectGranted
         ).count { it }
 
-    val totalCount: Int get() = 11
+    val totalCount: Int get() = 13
 
     val allEnabled: Boolean get() = grantedCount == totalCount
 
@@ -129,6 +133,20 @@ data class PermissionSnapshot(
             description = "Keep 'Hey Aether' responsive while screen/apps run",
             isGranted = batteryUnrestricted,
             isSpecialSettings = true
+        ),
+        PermissionItemStatus(
+            id = "notification_listener",
+            title = "Notification Copilot Hub",
+            description = "Read unread message digests & send instant voice replies",
+            isGranted = notificationAccessGranted,
+            isSpecialSettings = true
+        ),
+        PermissionItemStatus(
+            id = "bluetooth_connect",
+            title = "Bluetooth Auto-Triggers",
+            description = "Auto-brief unread alerts when earbuds or car audio connect",
+            isGranted = bluetoothConnectGranted,
+            isSpecialSettings = false
         )
     )
 }
@@ -146,6 +164,11 @@ class PermissionsManager(private val context: Context) {
         val location = hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
         val contacts = hasPermission(Manifest.permission.READ_CONTACTS)
         val callPhone = hasPermission(Manifest.permission.CALL_PHONE)
+        val bluetoothConnect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            true
+        }
         val accessibility = isAccessibilityServiceEnabled()
         val overlay = Settings.canDrawOverlays(context)
         val writeSettings = Settings.System.canWrite(context)
@@ -153,6 +176,7 @@ class PermissionsManager(private val context: Context) {
         val dndAccess = nm?.isNotificationPolicyAccessGranted == true
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val batteryUnrestricted = powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
+        val notificationAccess = isNotificationListenerEnabled()
 
         return PermissionSnapshot(
             micGranted = mic,
@@ -165,19 +189,29 @@ class PermissionsManager(private val context: Context) {
             overlayGranted = overlay,
             writeSettingsGranted = writeSettings,
             dndAccessGranted = dndAccess,
-            batteryUnrestricted = batteryUnrestricted
+            batteryUnrestricted = batteryUnrestricted,
+            notificationAccessGranted = notificationAccess,
+            bluetoothConnectGranted = bluetoothConnect
         )
     }
 
     fun isDefaultAssistantApp(): Boolean {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val rm = context.getSystemService(Context.ROLE_SERVICE) as? android.app.role.RoleManager
-            if (rm != null && rm.isRoleAvailable(android.app.role.RoleManager.ROLE_ASSISTANT)) {
-                return rm.isRoleHeld(android.app.role.RoleManager.ROLE_ASSISTANT)
+            if (rm != null && rm.isRoleAvailable(android.app.role.RoleManager.ROLE_ASSISTANT) &&
+                rm.isRoleHeld(android.app.role.RoleManager.ROLE_ASSISTANT)
+            ) {
+                return true
             }
         }
-        val assistantSetting = Settings.Secure.getString(context.contentResolver, "assistant").orEmpty()
-        return assistantSetting.contains(context.packageName, ignoreCase = true)
+        val assistantSetting = runCatching {
+            Settings.Secure.getString(context.contentResolver, "assistant")
+        }.getOrNull().orEmpty()
+        val voiceInteractionSetting = runCatching {
+            Settings.Secure.getString(context.contentResolver, "voice_interaction_service")
+        }.getOrNull().orEmpty()
+        return assistantSetting.contains(context.packageName, ignoreCase = true) ||
+            voiceInteractionSetting.contains(context.packageName, ignoreCase = true)
     }
 
     fun buildRequestDefaultAssistantIntent(): Intent {
@@ -192,6 +226,11 @@ class PermissionsManager(private val context: Context) {
         return Intent(Settings.ACTION_VOICE_INPUT_SETTINGS)
     }
 
+    companion object {
+        const val OS_HOTWORD_EXPLANATION =
+            "Android hardware DSP hotword ('Hey Google' with zero mic indicator via CAPTURE_AUDIO_HOTWORD) is restricted to signature|privileged pre-installed system apps—neither Default Assistant nor Device Admin can unlock it. In 0-Mic mode Aether opens via your OS Assistant gesture/power hold or Orb; enable On-Device KWS if you want 'Hey Aether' hands-free in foreground."
+    }
+
     fun runtimePermissionsToRequest(): Array<String> {
         val list = mutableListOf(
             Manifest.permission.RECORD_AUDIO,
@@ -202,6 +241,9 @@ class PermissionsManager(private val context: Context) {
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             list.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            list.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
         return list.toTypedArray()
     }
@@ -216,6 +258,19 @@ class PermissionsManager(private val context: Context) {
         return enabledServices.contains(expected, ignoreCase = true)
     }
 
+    fun isNotificationListenerEnabled(): Boolean {
+        val expectedFlat = "${context.packageName}/com.example.service.AetherNotificationListenerService"
+        val expectedShort = "${context.packageName}/.service.AetherNotificationListenerService"
+        val enabledListeners = runCatching {
+            Settings.Secure.getString(
+                context.contentResolver,
+                "enabled_notification_listeners"
+            )
+        }.getOrNull().orEmpty()
+        return enabledListeners.contains(expectedFlat, ignoreCase = true) ||
+            enabledListeners.contains(expectedShort, ignoreCase = true)
+    }
+
     fun buildSpecialSettingsIntent(permissionId: String): Intent {
         return when (permissionId) {
             "overlay" -> Intent(
@@ -223,6 +278,7 @@ class PermissionsManager(private val context: Context) {
                 Uri.parse("package:${context.packageName}")
             )
             "accessibility" -> Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+            "notification_listener" -> Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
             "dnd_policy" -> Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)
             "write_settings" -> Intent(
                 Settings.ACTION_MANAGE_WRITE_SETTINGS,

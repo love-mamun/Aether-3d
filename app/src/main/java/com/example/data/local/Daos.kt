@@ -110,3 +110,48 @@ interface ScreenMacroDao {
     @Query("DELETE FROM screen_macros WHERE id = :id")
     suspend fun deleteMacroById(id: Long)
 }
+
+@Dao
+interface AppPlaybookDao {
+    @Query("SELECT * FROM app_playbooks ORDER BY isPinned DESC, successCount DESC, lastUsedAt DESC")
+    fun observeAllPlaybooks(): Flow<List<AppPlaybookEntity>>
+
+    @Query("SELECT * FROM app_playbooks ORDER BY isPinned DESC, successCount DESC, lastUsedAt DESC")
+    suspend fun getAllPlaybooksSnapshot(): List<AppPlaybookEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertPlaybook(playbook: AppPlaybookEntity): Long
+
+    @Query("UPDATE app_playbooks SET successCount = successCount + 1, avgDurationMs = :avgDurationMs, lastUsedAt = :now WHERE id = :id")
+    suspend fun recordPlaybookSuccess(id: Long, avgDurationMs: Long, now: Long = System.currentTimeMillis())
+
+    @Query("UPDATE app_playbooks SET failureCount = failureCount + 1, lastUsedAt = :now WHERE id = :id")
+    suspend fun recordPlaybookFailure(id: Long, now: Long = System.currentTimeMillis())
+
+    @Query("UPDATE app_playbooks SET isPinned = :pinned WHERE id = :id")
+    suspend fun setPinned(id: Long, pinned: Boolean)
+
+    @Query("DELETE FROM app_playbooks WHERE id = :id")
+    suspend fun deletePlaybookById(id: Long)
+}
+
+@Dao
+interface SmartTriggerRuleDao {
+    @Query("SELECT * FROM smart_trigger_rules ORDER BY isEnabled DESC, createdAt DESC")
+    fun observeAllRules(): Flow<List<SmartTriggerRuleEntity>>
+
+    @Query("SELECT * FROM smart_trigger_rules ORDER BY createdAt DESC")
+    suspend fun getAllRulesSnapshot(): List<SmartTriggerRuleEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertRule(rule: SmartTriggerRuleEntity): Long
+
+    @Query("UPDATE smart_trigger_rules SET isEnabled = :enabled WHERE id = :id")
+    suspend fun setEnabled(id: Long, enabled: Boolean)
+
+    @Query("UPDATE smart_trigger_rules SET lastTriggeredAt = :triggeredAt WHERE id = :id")
+    suspend fun recordTriggered(id: Long, triggeredAt: Long = System.currentTimeMillis())
+
+    @Query("DELETE FROM smart_trigger_rules WHERE id = :id")
+    suspend fun deleteRuleById(id: Long)
+}

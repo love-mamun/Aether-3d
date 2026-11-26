@@ -26,18 +26,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.BatteryStd
-import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.FolderSpecial
-import androidx.compose.material.icons.filled.GraphicEq
-import androidx.compose.material.icons.filled.HourglassTop
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Shield
-import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.Sync
-import androidx.compose.material.icons.filled.TimerOff
 import androidx.compose.material.icons.filled.VerifiedUser
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.Wifi
@@ -60,9 +54,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.example.ai.ActiveTaskItem
 import com.example.ai.CoreMode
-import com.example.ai.TaskStatus
 import com.example.core.AssistantUiState
 import com.example.data.local.WakeTriggerMode
 import com.example.ui.theme.AlertCoral
@@ -108,6 +100,7 @@ fun TopTelemetryBar(
     onOpenVault: () -> Unit,
     onOpenApiSettings: () -> Unit = {},
     onOpenVoiceStudio: () -> Unit = {},
+    onOpenCameraLens: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val accent = MaterialTheme.colorScheme.primary
@@ -185,11 +178,33 @@ fun TopTelemetryBar(
             }
         }
 
-        // Right: Compact Permissions Readiness + SQLite Vault (Voice & API live inside Bottom-Right Settings)
+        // Right: Vision Lens + Compact Permissions Readiness + SQLite Vault
         Row(
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            Surface(
+                color = SmokedGlass,
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, accent.copy(alpha = 0.45f)),
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .testTag("camera_lens_button")
+                    .clickable(onClick = onOpenCameraLens)
+            ) {
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.CameraAlt,
+                        contentDescription = "Open Camera Vision Lens",
+                        tint = accent,
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+
             val allGranted = perms.allEnabled
             val permColor = if (allGranted) StealthEmerald else SolarGold
             Surface(
@@ -574,47 +589,15 @@ fun CoreStatusAndReplyOverlay(
             }
         }
 
-        // Live Multitasking DAG Queue Card
+        // Holographic Live Task DAG Graph Card
         AnimatedVisibility(visible = uiState.activeTasks.isNotEmpty()) {
-            Surface(
-                color = SmokedGlass,
-                shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.dp, accent.copy(alpha = 0.35f)),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        val doneCount = uiState.activeTasks.count { it.status == TaskStatus.DONE }
-                        Text(
-                            text = "TASK DAG ($doneCount/${uiState.activeTasks.size})",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = accent
-                        )
-                        if (uiState.coreMode == CoreMode.MULTITASKING || uiState.coreMode == CoreMode.THINKING) {
-                            IconButton(
-                                onClick = onAbortTasks,
-                                modifier = Modifier
-                                    .size(32.dp)
-                                    .testTag("abort_tasks_button")
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Close,
-                                    contentDescription = "Abort active tasks",
-                                    tint = AlertCoral,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                            }
-                        }
-                    }
-                    uiState.activeTasks.take(5).forEach { task ->
-                        TaskRowItem(task = task, accent = accent)
-                    }
-                }
-            }
+            LiveTaskGraphCard(
+                tasks = uiState.activeTasks,
+                coreMode = uiState.coreMode,
+                matchedPlaybookLabel = uiState.matchedPlaybookLabel,
+                lastAutoTriggerLabel = uiState.lastAutoTriggerLabel,
+                onAbortTasks = onAbortTasks
+            )
         }
 
         // Latest Response / Live Streaming / Error Card
@@ -692,86 +675,6 @@ fun CoreStatusAndReplyOverlay(
                     )
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun TaskRowItem(task: ActiveTaskItem, accent: Color) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 3.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        when (task.status) {
-            TaskStatus.RUNNING -> CircularProgressIndicator(
-                color = accent,
-                strokeWidth = 2.dp,
-                modifier = Modifier.size(14.dp)
-            )
-            TaskStatus.DONE -> Icon(
-                imageVector = Icons.Filled.CheckCircle,
-                contentDescription = "Task done",
-                tint = StealthEmerald,
-                modifier = Modifier.size(14.dp)
-            )
-            TaskStatus.FAILED -> Icon(
-                imageVector = Icons.Filled.ErrorOutline,
-                contentDescription = "Task failed",
-                tint = AlertCoral,
-                modifier = Modifier.size(14.dp)
-            )
-            TaskStatus.TIMED_OUT -> Icon(
-                imageVector = Icons.Filled.TimerOff,
-                contentDescription = "Task timed out",
-                tint = SolarGold,
-                modifier = Modifier.size(14.dp)
-            )
-            TaskStatus.SKIPPED -> Icon(
-                imageVector = Icons.Filled.SkipNext,
-                contentDescription = "Task skipped",
-                tint = HudTextSecondary,
-                modifier = Modifier.size(14.dp)
-            )
-            TaskStatus.NEEDS_CONFIRMATION -> Icon(
-                imageVector = Icons.Filled.HourglassTop,
-                contentDescription = "Task awaiting confirmation",
-                tint = SolarGold,
-                modifier = Modifier.size(14.dp)
-            )
-            TaskStatus.QUEUED -> Icon(
-                imageVector = Icons.Filled.Sync,
-                contentDescription = "Task queued",
-                tint = HudTextSecondary,
-                modifier = Modifier.size(14.dp)
-            )
-        }
-        Spacer(Modifier.width(8.dp))
-        val depPrefix = if (task.dependsOn.isNotEmpty()) "↳ " else ""
-        Text(
-            text = "$depPrefix${task.step.label}",
-            style = MaterialTheme.typography.labelMedium,
-            color = if (task.status == TaskStatus.SKIPPED) HudTextSecondary else HudTextPrimary,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f)
-        )
-        val timingSuffix = if (task.elapsedMs > 0L) " · ${task.elapsedMs}ms" else ""
-        val rightLabel = "${task.detail}$timingSuffix".trim()
-        if (rightLabel.isNotBlank()) {
-            Spacer(Modifier.width(6.dp))
-            Text(
-                text = rightLabel,
-                style = MaterialTheme.typography.labelSmall,
-                color = when (task.status) {
-                    TaskStatus.TIMED_OUT -> SolarGold
-                    TaskStatus.FAILED -> AlertCoral
-                    else -> HudTextSecondary
-                },
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
         }
     }
 }

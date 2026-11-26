@@ -139,6 +139,8 @@ class TaskDagExecutor {
 
         val stateLock = Any()
         val statusMap = nodes.associate { it.id to TaskStatus.QUEUED }.toMutableMap()
+        val outputsByStepId = mutableMapOf<String, String>()
+        var lastOutputValue = ""
         val toolOutputs = mutableListOf<String>()
         var completed = 0
         var failed = 0
@@ -210,15 +212,23 @@ class TaskDagExecutor {
                             return@async
                         }
 
-                        // Small UI settle delay if node depends on an app/settings launch
+                        // Small UI settle delay if node depends on an app launch or prior foreground automation
                         val hadLaunchDep = node.dependencies.any { depId ->
                             val depType = nodes.firstOrNull { it.id == depId }?.step?.actionType
                             depType == ActionType.LAUNCH_APP ||
                                 depType == ActionType.OPEN_SETTINGS ||
-                                depType == ActionType.SEARCH_IN_APP
+                                depType == ActionType.SEARCH_IN_APP ||
+                                depType == ActionType.SEND_APP_MESSAGE ||
+                                depType == ActionType.POST_SOCIAL ||
+                                depType == ActionType.PLAY_MEDIA
                         }
                         if (hadLaunchDep) {
                             delay(1_150L)
+                        }
+
+                        // Resolve {{stepId}} and {{last_output}} placeholders from completed prerequisites
+                        val resolvedStep = synchronized(stateLock) {
+                            resolveStepPlaceholders(node.step, outputsByStepId, lastOutputValue)
                         }
 
                         synchronized(stateLock) {
@@ -229,16 +239,35 @@ class TaskDagExecutor {
                         val startMs = System.currentTimeMillis()
 
                         try {
-                            val result = withContext(Dispatchers.IO) {
+                            var result = withContext(Dispatchers.IO) {
                                 withTimeout(node.timeoutMs) {
-                                    executor(node.step)
+                                    executor(resolvedStep)
                                 }
                             }
+                            // Self-healing 1-shot retry for transient UI/network glitches
+                            val canRetry = !result.success &&
+                                isRetryableAction(resolvedStep.actionType) &&
+                                (System.currentTimeMillis() - startMs) < (node.timeoutMs / 2L)
+                            if (canRetry) {
+                                delay(450L)
+                                val remainingMs = (node.timeoutMs - (System.currentTimeMillis() - startMs)).coerceAtLeast(1_500L)
+                                result = withContext(Dispatchers.IO) {
+                                    withTimeout(remainingMs) {
+                                        executor(resolvedStep)
+                                    }
+                                }
+                            }
+
                             val elapsed = (System.currentTimeMillis() - startMs).coerceAtLeast(1L)
                             if (result.torchStateChanged != null) {
                                 onTorchStateChanged(result.torchStateChanged)
                             }
                             synchronized(stateLock) {
+                                val outputForContext = (result.toolOutputForSummary ?: result.detail).trim()
+                                if (outputForContext.isNotBlank()) {
+                                    outputsByStepId[node.id] = outputForContext
+                                    lastOutputValue = outputForContext
+                                }
                                 result.toolOutputForSummary?.let { out -> toolOutputs.add(out) }
                                 if (result.success) {
                                     statusMap[node.id] = TaskStatus.DONE
@@ -300,8 +329,41 @@ class TaskDagExecutor {
         }
     }
 
+    internal fun resolveStepPlaceholders(
+        step: PlannedStep,
+        outputsByStepId: Map<String, String>,
+        lastOutput: String
+    ): PlannedStep {
+        fun substitute(raw: String): String {
+            if (!raw.contains("{{")) return raw
+            var out = raw.replace("{{last_output}}", lastOutput, ignoreCase = true)
+            for ((k, v) in outputsByStepId) {
+                out = out.replace("{{$k}}", v, ignoreCase = true)
+            }
+            return out
+        }
+        return step.copy(
+            textPayload = substitute(step.textPayload),
+            target = substitute(step.target),
+            recipient = substitute(step.recipient)
+        )
+    }
+
+    private fun isRetryableAction(actionType: ActionType): Boolean {
+        return when (actionType) {
+            ActionType.WEATHER_LOOKUP,
+            ActionType.WIKIPEDIA_LOOKUP,
+            ActionType.CURRENCY_CONVERT,
+            ActionType.LAUNCH_APP,
+            ActionType.PLAY_MEDIA,
+            ActionType.UI_TAP_TEXT,
+            ActionType.UI_INPUT_TEXT -> true
+            else -> false
+        }
+    }
+
     internal fun resolveTimeoutMs(step: PlannedStep): Long {
-        if (step.timeoutMs in 100L..60_000L) return step.timeoutMs
+        if (step.timeoutMs in 100L..90_000L) return step.timeoutMs
         return when (step.actionType) {
             ActionType.WEATHER_LOOKUP,
             ActionType.WIKIPEDIA_LOOKUP,
@@ -312,17 +374,22 @@ class TaskDagExecutor {
             ActionType.SEARCH_IN_APP,
             ActionType.OPEN_SETTINGS,
             ActionType.PLAY_MEDIA,
-            ActionType.NAVIGATE_MAPS -> 9_000L
+            ActionType.NAVIGATE_MAPS -> 35_000L
 
-            ActionType.SEND_APP_MESSAGE -> 45_000L
+            ActionType.SEND_APP_MESSAGE -> 55_000L
+            ActionType.POST_SOCIAL -> 70_000L
 
             ActionType.UI_TAP_TEXT,
             ActionType.UI_TAP_COORDINATES,
             ActionType.UI_INPUT_TEXT,
             ActionType.UI_SCROLL,
-            ActionType.GLOBAL_ACTION -> 7_000L
+            ActionType.GLOBAL_ACTION -> 8_500L
 
-            else -> 6_000L
+            ActionType.READ_NOTIFICATIONS,
+            ActionType.REPLY_NOTIFICATION,
+            ActionType.OPEN_CAMERA_LENS -> 9_000L
+
+            else -> 7_500L
         }
     }
 
@@ -334,6 +401,7 @@ class TaskDagExecutor {
             ActionType.DIAL_CONTACT,
             ActionType.SEND_MESSAGE,
             ActionType.SEND_APP_MESSAGE,
+            ActionType.POST_SOCIAL,
             ActionType.DRAFT_EMAIL,
             ActionType.NAVIGATE_MAPS,
             ActionType.PLAY_MEDIA,
@@ -343,7 +411,8 @@ class TaskDagExecutor {
             ActionType.UI_TAP_COORDINATES,
             ActionType.UI_INPUT_TEXT,
             ActionType.UI_SCROLL,
-            ActionType.GLOBAL_ACTION -> true
+            ActionType.GLOBAL_ACTION,
+            ActionType.OPEN_CAMERA_LENS -> true
 
             else -> false
         }

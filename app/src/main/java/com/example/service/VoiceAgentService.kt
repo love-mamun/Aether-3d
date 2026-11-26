@@ -44,11 +44,51 @@ class VoiceAgentService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        isServiceRunning = true
         val orchestrator = AgentOrchestrator.getInstance(this)
         val hasMic = ContextCompat.checkSelfPermission(
             this,
             Manifest.permission.RECORD_AUDIO
         ) == PackageManager.PERMISSION_GRANTED
+        val wakeTriggerMode = orchestrator.uiState.value.preferences.wakeTriggerMode
+
+        // Satisfy Android O+ startForegroundService contract IMMEDIATELY on every start path
+        val initialNotif = buildNotification(orchestrator)
+        val fgsType = resolveForegroundServiceType(
+            sdkInt = Build.VERSION.SDK_INT,
+            hasMic = hasMic,
+            wakeTriggerMode = wakeTriggerMode
+        )
+        val startedFg = try {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, initialNotif, fgsType)
+            true
+        } catch (se: SecurityException) {
+            Log.w("VoiceAgentService", "Primary FGS start rejected ($fgsType), retrying specialUse fallback", se)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                runCatching {
+                    ServiceCompat.startForeground(
+                        this,
+                        NOTIFICATION_ID,
+                        initialNotif,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                    )
+                    true
+                }.getOrDefault(false)
+            } else {
+                false
+            }
+        } catch (e: Exception) {
+            Log.e("VoiceAgentService", "startForeground failed", e)
+            false
+        }
+
+        if (!startedFg) {
+            orchestrator.stopFilteredBackgroundCapture()
+            orchestrator.setBackgroundServiceState(active = false, paused = false)
+            isServiceRunning = false
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         when (intent?.action) {
             ACTION_SPEAK -> {
@@ -72,7 +112,8 @@ class VoiceAgentService : Service() {
                 floatingOverlay?.hide()
                 orchestrator.abortAllTasks()
                 orchestrator.setBackgroundServiceState(active = false, paused = false)
-                stopForeground(STOP_FOREGROUND_REMOVE)
+                isServiceRunning = false
+                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 stopSelf()
                 return START_NOT_STICKY
             }
@@ -83,37 +124,9 @@ class VoiceAgentService : Service() {
             }
         }
 
-        if (!hasMic) {
-            Log.w("VoiceAgentService", "RECORD_AUDIO missing; cannot run microphone foreground service")
-            orchestrator.stopFilteredBackgroundCapture()
-            orchestrator.setBackgroundServiceState(active = false, paused = false)
-            stopSelf()
-            return START_NOT_STICKY
-        }
-
-        val initialNotif = buildNotification(orchestrator)
-        try {
-            val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            } else {
-                0
-            }
-            ServiceCompat.startForeground(this, NOTIFICATION_ID, initialNotif, fgsType)
-        } catch (se: SecurityException) {
-            Log.e("VoiceAgentService", "startForeground rejected by OS", se)
-            orchestrator.stopFilteredBackgroundCapture()
-            orchestrator.setBackgroundServiceState(active = false, paused = false)
-            stopSelf()
-            return START_NOT_STICKY
-        } catch (e: Exception) {
-            Log.e("VoiceAgentService", "startForeground failed", e)
-            orchestrator.stopFilteredBackgroundCapture()
-            orchestrator.setBackgroundServiceState(active = false, paused = false)
-            stopSelf()
-            return START_NOT_STICKY
-        }
-
-        if (isPaused) {
+        val allowPassiveMic = hasMic &&
+            wakeTriggerMode != com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY
+        if (isPaused || !allowPassiveMic) {
             orchestrator.stopFilteredBackgroundCapture()
             orchestrator.voiceManager.stopWakeWordListening()
         } else {
@@ -129,11 +142,11 @@ class VoiceAgentService : Service() {
 
                     val activeCount = state.activeTasks.size
                     val doneCount = state.activeTasks.count { it.status.name == "DONE" }
-                    val notifKey = "${isPaused}|${state.preferences.persona.name}|${state.coreMode.name}|$doneCount/$activeCount|${state.isWakeWordArmed}|${state.audioFilterDiagnostics.isCapturing}"
+                    val notifKey = "${isPaused}|${state.preferences.persona.name}|${state.preferences.wakeTriggerMode.name}|${state.coreMode.name}|$doneCount/$activeCount|${state.isWakeWordArmed}|${state.audioFilterDiagnostics.isCapturing}"
                     if (notifKey != lastNotificationStatus) {
                         lastNotificationStatus = notifKey
                         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                        nm.notify(NOTIFICATION_ID, buildNotification(orchestrator))
+                        runCatching { nm.notify(NOTIFICATION_ID, buildNotification(orchestrator)) }
                     }
 
                     if (!overlayDismissedByUser && Settings.canDrawOverlays(this@VoiceAgentService)) {
@@ -213,6 +226,7 @@ class VoiceAgentService : Service() {
     }
 
     override fun onDestroy() {
+        isServiceRunning = false
         floatingOverlay?.hide()
         floatingOverlay = null
         val orchestrator = AgentOrchestrator.getInstance(this)
@@ -231,6 +245,8 @@ class VoiceAgentService : Service() {
         val doneCount = state.activeTasks.count { it.status.name == "DONE" }
 
         val standbyLabel = when {
+            state.preferences.wakeTriggerMode == com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY ->
+                "0-Mic Assistant & Orb Ready"
             state.audioFilterDiagnostics.isCapturing -> "Filtered Mic Active"
             state.isWakeWordArmed -> "Say \"${state.preferences.customWakeWord}\""
             else -> "Standby Ready"
@@ -306,18 +322,42 @@ class VoiceAgentService : Service() {
         const val ACTION_SHOW_OVERLAY = "com.example.action.SHOW_OVERLAY"
         const val ACTION_STOP = "com.example.action.STOP"
 
+        @Volatile
+        var isServiceRunning: Boolean = false
+            private set
+
+        internal fun resolveForegroundServiceType(
+            sdkInt: Int,
+            hasMic: Boolean,
+            wakeTriggerMode: com.example.data.local.WakeTriggerMode
+        ): Int {
+            val useMicType = hasMic &&
+                wakeTriggerMode != com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY
+            return when {
+                useMicType && sdkInt >= Build.VERSION_CODES.R ->
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                sdkInt >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE ->
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+                else -> 0
+            }
+        }
+
         fun start(context: Context) {
             val intent = Intent(context, VoiceAgentService::class.java).setAction(ACTION_SHOW_OVERLAY)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            }.onFailure { err ->
+                Log.w("VoiceAgentService", "Unable to start foreground service: ${err.message}")
             }
         }
 
         fun stop(context: Context) {
             val intent = Intent(context, VoiceAgentService::class.java).setAction(ACTION_STOP)
-            context.startService(intent)
+            runCatching { context.startService(intent) }
         }
     }
 }

@@ -30,6 +30,7 @@ enum class ScreenSceneType {
     CHAT_LIST,
     CHAT_CONVERSATION,
     POST_COMPOSER,
+    AUDIENCE_OR_SHARE_STAGE,
     DIALOG_MODAL,
     SETTINGS_LIST,
     HOME_DESKTOP,
@@ -111,7 +112,8 @@ class OfflineScreenUnderstandingEngine {
         ocrLines: List<OcrLineItem>,
         ocrSummary: String,
         userPrompt: String,
-        visionTokenMode: VisionTokenMode
+        visionTokenMode: VisionTokenMode,
+        forceCloudEscalation: Boolean = false
     ): OfflineScreenAnalysis {
         val (labels, objects) = if (bitmap != null) {
             coroutineScope {
@@ -133,7 +135,8 @@ class OfflineScreenUnderstandingEngine {
             detectedObjects = objects,
             userPrompt = userPrompt,
             visionTokenMode = visionTokenMode,
-            hasSourceBitmap = bitmap != null
+            hasSourceBitmap = bitmap != null,
+            forceCloudEscalation = forceCloudEscalation
         )
     }
 
@@ -232,7 +235,8 @@ class OfflineScreenUnderstandingEngine {
             detectedObjects: List<DetectedVisualElement>,
             userPrompt: String,
             visionTokenMode: VisionTokenMode,
-            hasSourceBitmap: Boolean
+            hasSourceBitmap: Boolean,
+            forceCloudEscalation: Boolean = false
         ): OfflineScreenAnalysis {
             val parsedNodes = parseCompactNodes(rawUiSummary)
             val compactUi = compactAccessibilitySummary(rawUiSummary, maxNodes = 48)
@@ -258,7 +262,9 @@ class OfflineScreenUnderstandingEngine {
                 nodeCount = maxOf(nodeCount, parsedNodes.size),
                 ocrLineCount = ocrLines.size,
                 objectCount = detectedObjects.size,
-                hasSourceBitmap = hasSourceBitmap
+                hasSourceBitmap = hasSourceBitmap,
+                packageName = packageName,
+                forceCloudEscalation = forceCloudEscalation
             )
 
             val uiCharsSaved = (rawUiSummary.length - compactUi.length).coerceAtLeast(0)
@@ -410,8 +416,16 @@ class OfflineScreenUnderstandingEngine {
             ) {
                 return ScreenSceneType.CHAT_CONVERSATION
             }
-            if ((pkg.contains("katana") || pkg.contains("facebook") || pkg.contains("instagram")) &&
-                (allText.contains("create post") || allText.contains("share") || allText.contains("on your mind")) &&
+            if ((pkg.contains("katana") || pkg.contains("facebook") || pkg.contains("lite") || pkg.contains("instagram")) &&
+                (allText.contains("who can see") || allText.contains("post settings") ||
+                    (allText.contains("next") && (allText.contains("audience") || allText.contains("share"))) ||
+                    (allText.contains("share now") && !nodes.any { it.isEditable }))
+            ) {
+                return ScreenSceneType.AUDIENCE_OR_SHARE_STAGE
+            }
+            if ((pkg.contains("katana") || pkg.contains("facebook") || pkg.contains("lite") || pkg.contains("instagram")) &&
+                (allText.contains("create post") || allText.contains("share") || allText.contains("on your mind") ||
+                    allText.contains("write something") || allText.contains("মনে কী আছে")) &&
                 nodes.any { it.isEditable }
             ) {
                 return ScreenSceneType.POST_COMPOSER
@@ -451,7 +465,13 @@ class OfflineScreenUnderstandingEngine {
             if (pkg.contains("chrome") || pkg.contains("browser") || allText.contains("http") || allText.contains("www.")) {
                 return ScreenSceneType.WEB_OR_BROWSER
             }
-            if (allText.contains("allow") && (allText.contains("deny") || allText.contains("cancel") || allText.contains("ok"))) {
+            if ((allText.contains("allow") && (allText.contains("deny") || allText.contains("don't allow") || allText.contains("cancel") || allText.contains("ok"))) ||
+                allText.contains("not now") ||
+                allText.contains("skip for now") ||
+                allText.contains("keep editing") ||
+                (allText.contains("save login") && allText.contains("save")) ||
+                (allText.contains("turn on") && allText.contains("cancel"))
+            ) {
                 return ScreenSceneType.DIALOG_MODAL
             }
             if (visualLabels.any {
@@ -502,6 +522,16 @@ class OfflineScreenUnderstandingEngine {
             return pixelDependentCues.any { lower.contains(it) }
         }
 
+        fun isLiteOrCanvasApp(packageName: String): Boolean {
+            val pkg = packageName.lowercase(Locale.ROOT)
+            if (pkg.isBlank()) return false
+            return pkg.contains(".lite") ||
+                pkg.contains("mlite") ||
+                pkg.contains("fblite") ||
+                pkg.contains("opera.mini") ||
+                pkg.contains("webview")
+        }
+
         fun evaluateCloudBitmapNeed(
             prompt: String,
             visionTokenMode: VisionTokenMode,
@@ -509,14 +539,23 @@ class OfflineScreenUnderstandingEngine {
             nodeCount: Int,
             ocrLineCount: Int,
             objectCount: Int,
-            hasSourceBitmap: Boolean
+            hasSourceBitmap: Boolean,
+            packageName: String = "",
+            forceCloudEscalation: Boolean = false
         ): Pair<Boolean, String> {
             if (!hasSourceBitmap) return false to "No bitmap captured"
             if (visionTokenMode == VisionTokenMode.CLOUD_VISION) {
                 return true to "Full Cloud Vision mode"
             }
+            if (forceCloudEscalation) {
+                return true to "Hybrid Vision escalation for stalled/complex UI"
+            }
             if (requiresRawCloudPixels(prompt)) {
                 return true to "Visual color/photo detail requested"
+            }
+            // Lite/WebView/Canvas apps often expose sparse or unlabelled container trees — attach <=512px crop
+            if (isLiteOrCanvasApp(packageName) && nodeCount < 10) {
+                return true to "Lite/canvas app ($packageName, $nodeCount nodes) — attaching compact crop"
             }
             if (visionTokenMode == VisionTokenMode.OFFLINE_FIRST) {
                 val hasReadableContext = nodeCount >= 4 || ocrLineCount >= 3 || objectCount >= 1
@@ -767,6 +806,104 @@ class OfflineScreenUnderstandingEngine {
                         subGoalMatched = activeSubGoal,
                         reason = "ML Kit Object Detection matched video thumbnail box",
                         expectMoreSteps = false
+                    )
+                }
+            }
+
+            // 5. Blocking popup / permission modal dismissal (Not now, Skip, Keep editing, Allow)
+            val popupSafeLabels = listOf("not now", "skip for now", "skip", "keep editing", "got it", "allow", "while using the app")
+            val popupNode = nodes.firstOrNull { node ->
+                val l = node.label.trim().lowercase(Locale.ROOT)
+                l.isNotBlank() &&
+                    !l.contains("discard") &&
+                    !l.contains("delete") &&
+                    popupSafeLabels.any { l == it || l.contains(it) }
+            }
+            if (popupNode != null && analysis.sceneType == ScreenSceneType.DIALOG_MODAL) {
+                return OfflineResolvedAction(
+                    step = PlannedStep(
+                        actionType = ActionType.UI_TAP_COORDINATES,
+                        label = "Dismiss popup (${popupNode.label.take(18)})",
+                        intValue = popupNode.xNorm,
+                        secondaryIntValue = popupNode.yNorm
+                    ),
+                    subGoalMatched = activeSubGoal,
+                    reason = "Offline popup solver dismissed '${popupNode.label}'",
+                    expectMoreSteps = true
+                )
+            }
+
+            // 6. Multi-screen Social / Form progression (Next / Continue -> Share / Post / Publish)
+            if (subLower.contains("next") || subLower.contains("share") || subLower.contains("post") ||
+                subLower.contains("publish") || subLower.contains("পোস্ট") || subLower.contains("শেয়ার")
+            ) {
+                val publishWords = listOf("share now", "post", "publish", "share", "পোস্ট করুন", "পোস্ট", "শেয়ার")
+                val publishNode = nodes.firstOrNull { node ->
+                    val l = node.label.trim().lowercase(Locale.ROOT)
+                    ((node.yNorm <= 260 && node.xNorm >= 550) || node.yNorm >= 700) &&
+                        publishWords.any { l == it }
+                } ?: ocr.firstOrNull { line ->
+                    val l = line.text.trim().lowercase(Locale.ROOT)
+                    ((line.centerYNorm <= 260 && line.centerXNorm >= 550) || line.centerYNorm >= 700) &&
+                        publishWords.any { l == it }
+                }?.let {
+                    ParsedScreenNode(
+                        xNorm = it.centerXNorm,
+                        yNorm = it.centerYNorm,
+                        isClickable = true,
+                        isEditable = false,
+                        isScrollable = false,
+                        viewIdSuffix = "",
+                        label = it.text,
+                        rawLine = ""
+                    )
+                }
+                if (publishNode != null && analysis.sceneType != ScreenSceneType.POST_COMPOSER) {
+                    return OfflineResolvedAction(
+                        step = PlannedStep(
+                            actionType = ActionType.UI_TAP_COORDINATES,
+                            label = "Tap ${publishNode.label} offline",
+                            intValue = publishNode.xNorm,
+                            secondaryIntValue = publishNode.yNorm
+                        ),
+                        subGoalMatched = activeSubGoal,
+                        reason = "Offline solver tapped final '${publishNode.label}'",
+                        expectMoreSteps = false
+                    )
+                }
+
+                val nextWords = listOf("next", "পরবর্তী", "continue", "done")
+                val nextNode = nodes.firstOrNull { node ->
+                    val l = node.label.trim().lowercase(Locale.ROOT)
+                    ((node.yNorm <= 260 && node.xNorm >= 550) || node.yNorm >= 700) &&
+                        nextWords.any { l == it }
+                } ?: ocr.firstOrNull { line ->
+                    val l = line.text.trim().lowercase(Locale.ROOT)
+                    ((line.centerYNorm <= 260 && line.centerXNorm >= 550) || line.centerYNorm >= 700) &&
+                        nextWords.any { l == it }
+                }?.let {
+                    ParsedScreenNode(
+                        xNorm = it.centerXNorm,
+                        yNorm = it.centerYNorm,
+                        isClickable = true,
+                        isEditable = false,
+                        isScrollable = false,
+                        viewIdSuffix = "",
+                        label = it.text,
+                        rawLine = ""
+                    )
+                }
+                if (nextNode != null) {
+                    return OfflineResolvedAction(
+                        step = PlannedStep(
+                            actionType = ActionType.UI_TAP_COORDINATES,
+                            label = "Tap ${nextNode.label} offline",
+                            intValue = nextNode.xNorm,
+                            secondaryIntValue = nextNode.yNorm
+                        ),
+                        subGoalMatched = activeSubGoal,
+                        reason = "Offline solver tapped intermediate '${nextNode.label}'",
+                        expectMoreSteps = true
                     )
                 }
             }

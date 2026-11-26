@@ -22,9 +22,11 @@ private const val TAG = "AetherDatabase"
         VoiceRoutineEntity::class,
         QuickContactEntity::class,
         ReminderEntity::class,
-        ScreenMacroEntity::class
+        ScreenMacroEntity::class,
+        AppPlaybookEntity::class,
+        SmartTriggerRuleEntity::class
     ],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 abstract class AetherDatabase : RoomDatabase() {
@@ -34,6 +36,8 @@ abstract class AetherDatabase : RoomDatabase() {
     abstract fun quickContactDao(): QuickContactDao
     abstract fun reminderDao(): ReminderDao
     abstract fun screenMacroDao(): ScreenMacroDao
+    abstract fun appPlaybookDao(): AppPlaybookDao
+    abstract fun smartTriggerRuleDao(): SmartTriggerRuleDao
 
     companion object {
         private const val LEGACY_DB_NAME = "aether_3d_vault.db"
@@ -125,8 +129,47 @@ abstract class AetherDatabase : RoomDatabase() {
                 }
             }
 
+            val migration2To3 = object : Migration(2, 3) {
+                override fun migrate(db: SupportSQLiteDatabase) {
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS app_playbooks (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            appPackage TEXT NOT NULL,
+                            appLabel TEXT NOT NULL,
+                            intentPattern TEXT NOT NULL,
+                            variableKeysJson TEXT NOT NULL,
+                            stepsJson TEXT NOT NULL,
+                            successCount INTEGER NOT NULL,
+                            failureCount INTEGER NOT NULL,
+                            avgDurationMs INTEGER NOT NULL,
+                            isPinned INTEGER NOT NULL,
+                            lastUsedAt INTEGER NOT NULL,
+                            createdAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                    db.execSQL(
+                        """
+                        CREATE TABLE IF NOT EXISTS smart_trigger_rules (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                            name TEXT NOT NULL,
+                            triggerType TEXT NOT NULL,
+                            conditionValue TEXT NOT NULL,
+                            actionMode TEXT NOT NULL,
+                            actionPayload TEXT NOT NULL,
+                            cooldownMinutes INTEGER NOT NULL,
+                            isEnabled INTEGER NOT NULL,
+                            lastTriggeredAt INTEGER NOT NULL,
+                            createdAt INTEGER NOT NULL
+                        )
+                        """.trimIndent()
+                    )
+                }
+            }
+
             return builder
-                .addMigrations(migration1To2)
+                .addMigrations(migration1To2, migration2To3)
                 .addCallback(object : Callback() {
                     override fun onCreate(db: SupportSQLiteDatabase) {
                         super.onCreate(db)
@@ -140,6 +183,15 @@ abstract class AetherDatabase : RoomDatabase() {
                             if (!migrated) {
                                 seedDefaultRoutines(instance.voiceRoutineDao())
                             }
+                            seedDefaultTriggerRules(instance.smartTriggerRuleDao())
+                        }
+                    }
+
+                    override fun onOpen(db: SupportSQLiteDatabase) {
+                        super.onOpen(db)
+                        CoroutineScope(Dispatchers.IO).launch {
+                            val instance = getInstance(appContext)
+                            seedDefaultTriggerRules(instance.smartTriggerRuleDao())
                         }
                     }
                 })
@@ -167,6 +219,32 @@ abstract class AetherDatabase : RoomDatabase() {
                     triggerPhrase = "Night Shield",
                     description = "Dim brightness, mute media & set 7 AM alarm",
                     instructionPrompt = "Turn off flashlight, set brightness to 20 percent, and set an alarm for 7:00 AM."
+                )
+            )
+        }
+
+        private suspend fun seedDefaultTriggerRules(triggerDao: SmartTriggerRuleDao) {
+            if (triggerDao.getAllRulesSnapshot().isNotEmpty()) return
+            triggerDao.insertRule(
+                SmartTriggerRuleEntity(
+                    name = "Headset Unread Digest",
+                    triggerType = "BLUETOOTH_CONNECTED",
+                    conditionValue = "",
+                    actionMode = "SPEAK_NOTIFICATION_DIGEST",
+                    actionPayload = "Read unread notification digest on Bluetooth audio connect",
+                    cooldownMinutes = 10,
+                    isEnabled = false
+                )
+            )
+            triggerDao.insertRule(
+                SmartTriggerRuleEntity(
+                    name = "Low Battery Shield",
+                    triggerType = "BATTERY_LOW",
+                    conditionValue = "20",
+                    actionMode = "RUN_PROMPT_COMMAND",
+                    actionPayload = "Set brightness to 25 percent and summarize battery status.",
+                    cooldownMinutes = 45,
+                    isEnabled = false
                 )
             )
         }

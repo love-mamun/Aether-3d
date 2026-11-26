@@ -201,13 +201,15 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `permissions manager reports all eleven capabilities and valid intents`() {
+    fun `permissions manager reports all thirteen capabilities and valid intents`() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val manager = PermissionsManager(context)
         val snapshot = manager.checkSnapshot()
 
-        assertEquals(11, snapshot.totalCount)
-        assertEquals(11, snapshot.toItemList().size)
+        assertEquals(13, snapshot.totalCount)
+        assertEquals(13, snapshot.toItemList().size)
+        assertTrue(snapshot.toItemList().any { it.id == "notification_listener" })
+        assertTrue(snapshot.toItemList().any { it.id == "bluetooth_connect" })
         assertTrue(manager.runtimePermissionsToRequest().isNotEmpty())
         assertEquals(
             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -216,6 +218,10 @@ class ExampleRobolectricTest {
         assertEquals(
             Settings.ACTION_ACCESSIBILITY_SETTINGS,
             manager.buildSpecialSettingsIntent("accessibility").action
+        )
+        assertEquals(
+            Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS,
+            manager.buildSpecialSettingsIntent("notification_listener").action
         )
     }
 
@@ -1393,5 +1399,435 @@ class ExampleRobolectricTest {
         composeRule.onNodeWithTag("settings_tokens_saved_label").assertIsDisplayed()
         composeRule.onNodeWithTag("vision_mode_hybrid_compact").performClick()
         assertEquals(com.example.data.local.VisionTokenMode.HYBRID_COMPACT, selectedMode)
+    }
+
+    @Test
+    fun `voice agent service resolves safe FGS types and starts cleanly without mic permission`() {
+        assertEquals(
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            com.example.service.VoiceAgentService.resolveForegroundServiceType(
+                sdkInt = 35,
+                hasMic = true,
+                wakeTriggerMode = com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY
+            )
+        )
+        assertEquals(
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+            com.example.service.VoiceAgentService.resolveForegroundServiceType(
+                sdkInt = 35,
+                hasMic = false,
+                wakeTriggerMode = com.example.data.local.WakeTriggerMode.HYBRID_KWS_AND_BUTTON
+            )
+        )
+        assertEquals(
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE,
+            com.example.service.VoiceAgentService.resolveForegroundServiceType(
+                sdkInt = 35,
+                hasMic = true,
+                wakeTriggerMode = com.example.data.local.WakeTriggerMode.HYBRID_KWS_AND_BUTTON
+            )
+        )
+
+        val controller = org.robolectric.Robolectric.buildService(com.example.service.VoiceAgentService::class.java)
+        val service = controller.create().get()
+        val intent = android.content.Intent(
+            ApplicationProvider.getApplicationContext(),
+            com.example.service.VoiceAgentService::class.java
+        ).setAction(com.example.service.VoiceAgentService.ACTION_SHOW_OVERLAY)
+        val result = service.onStartCommand(intent, 0, 1)
+        assertEquals(android.app.Service.START_STICKY, result)
+        assertTrue(com.example.service.VoiceAgentService.isServiceRunning)
+
+        val stopIntent = android.content.Intent(
+            ApplicationProvider.getApplicationContext(),
+            com.example.service.VoiceAgentService::class.java
+        ).setAction(com.example.service.VoiceAgentService.ACTION_STOP)
+        service.onStartCommand(stopIntent, 0, 2)
+        assertFalse(com.example.service.VoiceAgentService.isServiceRunning)
+    }
+
+    @Test
+    fun `lightweight piper catalog has zero bundled apk assets and preferences persist autoZeroMic`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val piper = com.example.voice.PiperNeuralVoiceManager(context)
+        assertTrue(
+            "APK must remain lightweight with zero bundled voice assets",
+            piper.catalog.none { it.isBundledAsset }
+        )
+        assertTrue(piper.catalog.any { it.id == com.example.voice.BUNDLED_STARTER_VOICE_ID && it.downloadUrl.startsWith("https://") })
+
+        val vault = VaultRepository(context)
+        assertTrue(vault.loadPreferences().autoZeroMicOnDefaultAssistant)
+        vault.savePreferences(vault.loadPreferences().copy(autoZeroMicOnDefaultAssistant = false))
+        assertFalse(vault.loadPreferences().autoZeroMicOnDefaultAssistant)
+    }
+
+    @Test
+    fun `system assistant overlay sheet renders controls, task chips, and submits commands`() {
+        var submittedText = ""
+        var micTapped = 0
+        var closed = 0
+        val overlayState = AssistantUiState(
+            coreMode = CoreMode.IDLE,
+            latestReply = "Ready over Facebook Lite."
+        )
+
+        composeRule.setContent {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
+                com.example.service.AetherAssistantOverlaySheet(
+                    state = overlayState,
+                    assistScreenHint = "com.facebook.lite: What's on your mind?",
+                    onSubmitText = { submittedText = it },
+                    onMicTap = { micTapped++ },
+                    onAbortTap = {},
+                    onOpenFullHud = {},
+                    onCloseSheet = { closed++ }
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("assistant_overlay_sheet").assertIsDisplayed()
+        composeRule.onNodeWithTag("overlay_mic_button").assertIsDisplayed().performClick()
+        assertEquals(1, micTapped)
+
+        composeRule.onNodeWithTag("overlay_command_input").performTextReplacement("Post on Facebook Lite Hey guys")
+        composeRule.onNodeWithTag("overlay_send_button").assertIsDisplayed().performClick()
+        assertEquals("Post on Facebook Lite Hey guys", submittedText)
+
+        composeRule.onNodeWithTag("overlay_close_button").performClick()
+        assertEquals(1, closed)
+    }
+
+    @Test
+    fun `settings hub displays os hotword explanation banner and voice studio shows download hub card`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val piper = com.example.voice.PiperNeuralVoiceManager(context)
+        val uiState = AssistantUiState(
+            isDefaultAssistant = true,
+            voicePacks = piper.packStates.value
+        )
+
+        composeRule.setContent {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
+                androidx.compose.foundation.layout.Column {
+                    com.example.ui.components.SettingsHubContent(
+                        uiState = uiState,
+                        onDismiss = {},
+                        onSelectPersona = {},
+                        onToggleWakeWord = {},
+                        onUpdateWakeWordPhrase = {},
+                        onTogglePauseWakeDuringMusic = {},
+                        onToggleBargeIn = {},
+                        onToggleContinuousLoop = {},
+                        onToggleAutonomousMode = {},
+                        onSelectLocale = {},
+                        onOpenVoiceStudio = {},
+                        onOpenApiSettings = {},
+                        onOpenPermissions = {},
+                        modifier = androidx.compose.ui.Modifier
+                            .fillMaxWidth()
+                            .height(400.dp)
+                    )
+                    com.example.ui.components.VoiceStudioContent(
+                        uiState = uiState,
+                        onClose = null,
+                        onSelectEngineMode = {},
+                        onSelectBargeInMode = {},
+                        onDownloadPack = {},
+                        onSelectPack = {},
+                        onDeletePack = {},
+                        onTestSample = {},
+                        modifier = androidx.compose.ui.Modifier
+                            .fillMaxWidth()
+                            .height(400.dp)
+                    )
+                }
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("settings_hub_sheet")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("os_hotword_explanation_banner"))
+        composeRule.onNodeWithTag("os_hotword_explanation_banner").assertIsDisplayed()
+        composeRule.onNodeWithTag("voice_studio_sheet")
+            .performScrollToNode(androidx.compose.ui.test.hasTestTag("in_app_download_hub_card"))
+        composeRule.onNodeWithTag("in_app_download_hub_card").assertIsDisplayed()
+    }
+
+    @Test
+    fun `notification copilot clusters alerts builds bilingual digest and dismisses cleanly`() {
+        val store = com.example.notifications.NotificationCopilotStore
+        store.clearAll()
+        store.upsertExternalNotification(
+            key = "wa_1",
+            packageName = "com.whatsapp",
+            appLabel = "WhatsApp",
+            senderName = "Rafiq",
+            previewText = "Hey, meeting at 5 PM?",
+            timestamp = 1000L
+        )
+        store.upsertExternalNotification(
+            key = "wa_2",
+            packageName = "com.whatsapp",
+            appLabel = "WhatsApp",
+            senderName = "Rafiq",
+            previewText = "Bring the slides too",
+            timestamp = 2000L
+        )
+        store.upsertExternalNotification(
+            key = "fb_1",
+            packageName = "com.facebook.orca",
+            appLabel = "Messenger",
+            senderName = "Nadia",
+            previewText = "Call me later",
+            timestamp = 1500L
+        )
+
+        val clusters = store.clusters.value
+        assertEquals(2, clusters.size)
+        assertEquals("Rafiq", clusters.first().senderName)
+        assertEquals(2, clusters.first().messageCount)
+
+        val enDigest = store.buildSpokenDigest(preferBangla = false)
+        val bnDigest = store.buildSpokenDigest(preferBangla = true)
+        assertTrue(enDigest.contains("Rafiq") && enDigest.contains("WhatsApp"))
+        assertTrue(bnDigest.contains("Rafiq") && bnDigest.contains("অপঠিত"))
+
+        assertEquals("Rafiq", store.findClusterByQuery("raf")?.senderName)
+        store.dismissCluster(clusters.first().clusterId)
+        assertEquals(1, store.clusters.value.size)
+        store.clearAll()
+        assertTrue(store.clusters.value.isEmpty())
+    }
+
+    @Test
+    fun `playbook learning engine distills parameterized slots and matches repeat commands`() {
+        val rawSteps = listOf(
+            com.example.automation.PlaybookStep("LAUNCH", "Facebook Lite"),
+            com.example.automation.PlaybookStep("TAP_TEXT", "What's on your mind?"),
+            com.example.automation.PlaybookStep("INPUT", "What's on your mind?", literalFallback = "Hello world from Aether"),
+            com.example.automation.PlaybookStep("TAP_TEXT", "Post")
+        )
+        val learned = com.example.automation.PlaybookLearningEngine.distillPlaybook(
+            appPackage = "com.facebook.lite",
+            appLabel = "Facebook Lite",
+            userPrompt = "Write a post on Facebook Lite saying Hello world from Aether",
+            rawSteps = rawSteps,
+            durationMs = 4200L
+        )
+        assertEquals("facebook_lite:post_social", learned.intentPattern)
+        assertTrue(learned.variableKeysJson.contains("postText"))
+
+        val match = com.example.automation.PlaybookLearningEngine.findMatchingPlaybook(
+            userPrompt = "Post on Facebook Lite that Good morning Dhaka!",
+            playbooks = listOf(learned)
+        )
+        assertNotNull(match)
+        assertTrue(match!!.confidenceScore >= 0.72f)
+        val compiled = com.example.automation.PlaybookLearningEngine.compilePlaybookToPlannedSteps(match)
+        assertEquals(4, compiled.size)
+        assertEquals(ActionType.LAUNCH_APP, compiled.first().actionType)
+        assertTrue(compiled[2].textPayload.contains("Good morning Dhaka", ignoreCase = true))
+    }
+
+    @Test
+    fun `device context trigger monitor enforces cooldown and thresholds`() {
+        val rules = listOf(
+            com.example.data.local.SmartTriggerRuleEntity(
+                id = 1L,
+                name = "Headset Digest",
+                triggerType = "BLUETOOTH_CONNECTED",
+                conditionValue = "",
+                actionMode = "SPEAK_NOTIFICATION_DIGEST",
+                cooldownMinutes = 15,
+                isEnabled = true,
+                lastTriggeredAt = 0L
+            ),
+            com.example.data.local.SmartTriggerRuleEntity(
+                id = 2L,
+                name = "Low Battery Shield",
+                triggerType = "BATTERY_LOW",
+                conditionValue = "20",
+                actionMode = "RUN_PROMPT_COMMAND",
+                actionPayload = "Turn off Wi-Fi",
+                cooldownMinutes = 30,
+                isEnabled = true,
+                lastTriggeredAt = 0L
+            )
+        )
+
+        val now = 10_000_000L
+        val btMatches = com.example.automation.DeviceContextTriggerMonitor.evaluateRulesForEvent(
+            rules = rules,
+            event = com.example.automation.ContextTriggerEvent("BLUETOOTH_CONNECTED", "Sony WH-1000XM5"),
+            nowMillis = now
+        )
+        assertEquals(1, btMatches.size)
+
+        // Cooldown gate suppresses immediate repeat
+        val cooldownRules = rules.map { if (it.id == 1L) it.copy(lastTriggeredAt = now - 60_000L) else it }
+        val suppressed = com.example.automation.DeviceContextTriggerMonitor.evaluateRulesForEvent(
+            rules = cooldownRules,
+            event = com.example.automation.ContextTriggerEvent("BLUETOOTH_CONNECTED", "Sony WH-1000XM5"),
+            nowMillis = now
+        )
+        assertTrue(suppressed.isEmpty())
+
+        // Battery above threshold does not fire, below/equal fires
+        assertTrue(
+            com.example.automation.DeviceContextTriggerMonitor.evaluateRulesForEvent(
+                rules = rules,
+                event = com.example.automation.ContextTriggerEvent("BATTERY_LOW", "45"),
+                nowMillis = now
+            ).isEmpty()
+        )
+        assertEquals(
+            1,
+            com.example.automation.DeviceContextTriggerMonitor.evaluateRulesForEvent(
+                rules = rules,
+                event = com.example.automation.ContextTriggerEvent("BATTERY_LOW", "18"),
+                nowMillis = now
+            ).size
+        )
+    }
+
+    @Test
+    fun `offline command router matches notification digest and camera lens safely`() {
+        val readMatch = com.example.system.OfflineCommandRouter.tryMatch("Read my unread notifications")
+        assertNotNull(readMatch)
+        assertEquals(ActionType.READ_NOTIFICATIONS, readMatch!!.plan.steps.first().actionType)
+
+        val lensMatch = com.example.system.OfflineCommandRouter.tryMatch("Open camera lens")
+        assertNotNull(lensMatch)
+        assertEquals(ActionType.OPEN_CAMERA_LENS, lensMatch!!.plan.steps.first().actionType)
+
+        // Multi-clause prompt must bypass deterministic single shortcut
+        val compound = com.example.system.OfflineCommandRouter.tryMatch("Read my notifications and turn on flashlight")
+        assertEquals(null, compound)
+    }
+
+    @Test
+    fun `vault repository v3 persists playbooks and smart trigger rules`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val vault = VaultRepository(context)
+
+        val pbId = vault.savePlaybook(
+            com.example.data.local.AppPlaybookEntity(
+                appPackage = "com.facebook.lite",
+                appLabel = "Facebook Lite",
+                intentPattern = "facebook_lite_post",
+                variableKeysJson = "[\"postText\"]",
+                stepsJson = "[]",
+                avgDurationMs = 3100L
+            )
+        )
+        assertTrue(pbId > 0L)
+        vault.recordPlaybookSuccess(pbId, 2500L)
+        val loadedPb = vault.getPlaybooksSnapshot().first { it.id == pbId }
+        assertTrue(loadedPb.successCount >= 2)
+
+        val ruleId = vault.saveTriggerRule(
+            com.example.data.local.SmartTriggerRuleEntity(
+                name = "Office Wi-Fi Briefing",
+                triggerType = "WIFI_CONNECTED",
+                actionMode = "SPEAK_NOTIFICATION_DIGEST",
+                cooldownMinutes = 20,
+                isEnabled = true
+            )
+        )
+        assertTrue(ruleId > 0L)
+        val rules = vault.getTriggerRulesSnapshot()
+        assertTrue(rules.any { it.id == ruleId && it.name == "Office Wi-Fi Briefing" && it.isEnabled })
+        vault.deletePlaybook(pbId)
+        vault.deleteTriggerRule(ruleId)
+    }
+
+    @Test
+    fun `live task graph card renders topological dag canvas and toggles compact view`() {
+        val tasks = listOf(
+            com.example.ai.ActiveTaskItem(
+                id = "t1",
+                step = PlannedStep(ActionType.LAUNCH_APP, "Open Facebook Lite", target = "Facebook Lite", stepId = "t1"),
+                status = com.example.ai.TaskStatus.DONE,
+                detail = "Opened",
+                elapsedMs = 240L
+            ),
+            com.example.ai.ActiveTaskItem(
+                id = "t2",
+                step = PlannedStep(ActionType.POST_SOCIAL, "Publish Post", target = "Facebook Lite", stepId = "t2", dependsOn = listOf("t1")),
+                status = com.example.ai.TaskStatus.RUNNING,
+                detail = "Typing caption",
+                dependsOn = listOf("t1")
+            )
+        )
+
+        val columns = com.example.ui.components.computeDagColumns(tasks)
+        assertEquals(2, columns.size)
+
+        composeRule.setContent {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
+                com.example.ui.components.LiveTaskGraphCard(
+                    tasks = tasks,
+                    coreMode = CoreMode.MULTITASKING,
+                    matchedPlaybookLabel = "Playbook: Facebook Lite (240ms)",
+                    onAbortTasks = {}
+                )
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("live_task_graph_card").assertIsDisplayed()
+        composeRule.onNodeWithTag("live_task_graph_canvas").assertIsDisplayed()
+        composeRule.onNodeWithTag("matched_playbook_badge").assertIsDisplayed()
+        composeRule.onNodeWithTag("dag_node_t1").performClick()
+        composeRule.onNodeWithTag("dag_node_inspector").assertIsDisplayed()
+        composeRule.onNodeWithTag("task_graph_toggle_button").performClick()
+        composeRule.waitForIdle()
+    }
+
+    @Test
+    fun `unread digest pill and notification copilot sheet display clustered alerts`() {
+        val cluster = com.example.notifications.UnreadNotificationCluster(
+            clusterId = "com.whatsapp::rafiq",
+            notificationKey = "wa_1",
+            packageName = "com.whatsapp",
+            appLabel = "WhatsApp",
+            senderName = "Rafiq",
+            latestMessage = "On my way!",
+            messageCount = 2,
+            timestamp = System.currentTimeMillis(),
+            hasQuickReply = true
+        )
+
+        var digestClicks = 0
+        composeRule.setContent {
+            Aether3DTheme(persona = AssistantPersona.AETHER) {
+                androidx.compose.foundation.layout.Column {
+                    com.example.ui.components.UnreadDigestPill(
+                        clusters = listOf(cluster),
+                        listenerConnected = true,
+                        onOpenCopilot = {}
+                    )
+                    com.example.ui.components.NotificationCopilotContent(
+                        clusters = listOf(cluster),
+                        listenerEnabled = true,
+                        onClose = {},
+                        onRequestNotificationPermission = {},
+                        onSpeakDigest = { digestClicks++ },
+                        onSendReply = { _, _ -> },
+                        onDismissCluster = {},
+                        onClearAll = {}
+                    )
+                }
+            }
+        }
+
+        composeRule.waitForIdle()
+        composeRule.onNodeWithTag("unread_digest_pill").assertIsDisplayed()
+        composeRule.onNodeWithTag("notification_copilot_sheet").assertIsDisplayed()
+        composeRule.onNodeWithTag("notif_cluster_card").assertIsDisplayed()
+        composeRule.onNodeWithTag("speak_digest_button").performClick()
+        assertEquals(1, digestClicks)
     }
 }

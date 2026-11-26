@@ -100,6 +100,12 @@ data class AssistantUiState(
     val isDefaultAssistant: Boolean = false,
     val estimatedTokensSavedSession: Long = 0L,
     val offlineVisionSummaryLabel: String = "",
+    val unreadNotifications: List<com.example.notifications.UnreadNotificationCluster> = emptyList(),
+    val notificationListenerConnected: Boolean = false,
+    val cameraLensRequested: Boolean = false,
+    val matchedPlaybookLabel: String = "",
+    val lastAutoTriggerLabel: String = "",
+    val lensCueState: com.example.camera.CameraLensCueState = com.example.camera.CameraLensCueState(),
     val errorMessage: String? = null
 )
 
@@ -147,6 +153,12 @@ class AgentOrchestrator private constructor(context: Context) {
     val commAudioRouter = CommunicationAudioRouter(appContext)
     val filteredMicEngine = FilteredMicrophoneEngine(appContext, commAudioRouter)
     val piperManager = PiperNeuralVoiceManager(appContext)
+    val cameraLensEngine = com.example.camera.CameraXLensEngine(appContext)
+    private val triggerMonitor = com.example.automation.DeviceContextTriggerMonitor(
+        context = appContext,
+        rulesProvider = { vaultRepository.getTriggerRulesSnapshot() },
+        onRuleMatched = { rule, event -> handleTriggeredRule(rule, event) }
+    )
 
     private val actionRouter = AndroidActionRouter(
         context = appContext,
@@ -208,6 +220,39 @@ class AgentOrchestrator private constructor(context: Context) {
     private var isForegroundListeningSession = false
     @Volatile
     private var usedFilteredFallbackThisTurn = false
+    @Volatile
+    private var suppressPassiveWakeUntilMs = 0L
+    @Volatile
+    private var lastSystemAssistPackage = ""
+    @Volatile
+    private var lastSystemAssistHint = ""
+    @Volatile
+    private var lastSystemAssistAtMs = 0L
+
+    fun prepareExternalVoiceTrigger(graceWindowMs: Long = 5_000L) {
+        suppressPassiveWakeUntilMs = android.os.SystemClock.elapsedRealtime() + graceWindowMs
+        isForegroundListeningSession = true
+        voiceManager.stopWakeWordListening()
+        if (filteredMicEngine.isCapturing) {
+            filteredMicEngine.stopCapture()
+        }
+        _uiState.update { it.copy(isWakeWordArmed = false) }
+    }
+
+    fun updateSystemAssistContext(packageName: String, extractedText: String) {
+        val cleanPkg = packageName.trim()
+        val cleanText = extractedText.trim()
+        if (cleanPkg.isBlank() && cleanText.isBlank()) return
+        lastSystemAssistPackage = cleanPkg
+        lastSystemAssistHint = buildString {
+            if (cleanPkg.isNotBlank()) append("Foreground App: $cleanPkg")
+            if (cleanText.isNotBlank()) {
+                if (isNotEmpty()) append("\n")
+                append("AssistStructure Snapshot:\n$cleanText")
+            }
+        }
+        lastSystemAssistAtMs = android.os.SystemClock.elapsedRealtime()
+    }
 
     val voiceManager: VoiceAndTtsManager = VoiceAndTtsManager(
         context = appContext,
@@ -369,6 +414,25 @@ class AgentOrchestrator private constructor(context: Context) {
                 }
             }
         }
+        scope.launch {
+            com.example.notifications.NotificationCopilotStore.clusters.collect { clusters ->
+                _uiState.update {
+                    it.copy(
+                        unreadNotifications = clusters,
+                        notificationListenerConnected = com.example.notifications.NotificationCopilotStore.isListenerConnected ||
+                            it.permissionSnapshot.notificationAccessGranted
+                    )
+                }
+            }
+        }
+        scope.launch {
+            cameraLensEngine.cueState.collect { cue ->
+                _uiState.update { it.copy(lensCueState = cue) }
+            }
+        }
+        triggerMonitor.attachScopeEvaluator(scope) { work ->
+            scope.launch(Dispatchers.IO) { work() }
+        }
         ScreenMacroManager.onRecordingStateChanged = { recording, count ->
             _uiState.update {
                 it.copy(isMacroRecording = recording, macroStepCount = count)
@@ -493,6 +557,12 @@ class AgentOrchestrator private constructor(context: Context) {
     }
 
     fun maybeArmWakeWord() {
+        val nowElapsed = android.os.SystemClock.elapsedRealtime()
+        if (isForegroundListeningSession || nowElapsed < suppressPassiveWakeUntilMs) {
+            voiceManager.stopWakeWordListening()
+            _uiState.update { it.copy(isWakeWordArmed = false) }
+            return
+        }
         val state = _uiState.value
         val prefs = state.preferences
         val hasMic = androidx.core.content.ContextCompat.checkSelfPermission(
@@ -530,6 +600,7 @@ class AgentOrchestrator private constructor(context: Context) {
 
     fun refreshPermissionsAndTelemetry() {
         scope.launch {
+            val wasDefaultAssistant = _uiState.value.isDefaultAssistant
             val (perms, telemetry, isDefaultAssist) = withContext(Dispatchers.IO) {
                 Triple(
                     permissionsManager.checkSnapshot(),
@@ -537,6 +608,12 @@ class AgentOrchestrator private constructor(context: Context) {
                     permissionsManager.isDefaultAssistantApp()
                 )
             }
+            val currentPrefs = _uiState.value.preferences
+            val transitionedToDefaultAssist = !wasDefaultAssistant &&
+                isDefaultAssist &&
+                currentPrefs.autoZeroMicOnDefaultAssistant &&
+                currentPrefs.wakeTriggerMode != com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY
+
             _uiState.update {
                 it.copy(
                     permissionSnapshot = perms,
@@ -546,7 +623,23 @@ class AgentOrchestrator private constructor(context: Context) {
                     encryptionBadgeLabel = vaultRepository.encryptionStatusLabel
                 )
             }
-            maybeArmWakeWord()
+            if (transitionedToDefaultAssist) {
+                updatePreferences {
+                    it.copy(
+                        wakeTriggerMode = com.example.data.local.WakeTriggerMode.ASSISTANT_BUTTON_ONLY,
+                        wakeWordEnabled = false
+                    )
+                }
+                _uiState.update { state ->
+                    if (state.coreMode == CoreMode.IDLE) {
+                        state.copy(
+                            latestReply = "Default Digital Assistant active (0-Mic Standby). Hold Power/Home or swipe corner anytime to summon Aether."
+                        )
+                    } else state
+                }
+            } else {
+                maybeArmWakeWord()
+            }
         }
     }
 
@@ -735,7 +828,9 @@ class AgentOrchestrator private constructor(context: Context) {
             return
         }
 
-        // Release any active continuous background capture first so foreground voice never hits mic contention
+        // Release any active passive wake listener or background capture first so foreground voice never hits mic contention
+        suppressPassiveWakeUntilMs = android.os.SystemClock.elapsedRealtime() + 4_500L
+        voiceManager.stopWakeWordListening()
         if (filteredMicEngine.isCapturing) {
             filteredMicEngine.stopCapture()
         }
@@ -1389,6 +1484,41 @@ class AgentOrchestrator private constructor(context: Context) {
                     return@launch
                 }
 
+                // Offline zero-cost deterministic router runs early so instant toggles don't hit playbooks
+                val quickOfflineCheck = if (attachedImage == null) {
+                    withContext(Dispatchers.IO) {
+                        OfflineCommandRouter.tryMatch(effectivePrompt) {
+                            telemetryProvider.queryLauncherAppMap()
+                        }
+                    }
+                } else null
+                if (quickOfflineCheck != null) {
+                    _uiState.update { it.copy(activeAiModelLabel = quickOfflineCheck.label) }
+                    val quickBundle = withContext(Dispatchers.IO) {
+                        ensureConversationMemoryReady()
+                        ContextSnapshotBundle(
+                            resolvedPrompt = effectivePrompt,
+                            memoriesText = "",
+                            routinesText = "",
+                            contactsText = "",
+                            appsText = "",
+                            historyText = buildConversationHistorySummary(),
+                            historyPairs = buildConversationHistoryPairs(),
+                            telemetryText = telemetryProvider.buildPromptTelemetrySummary(telemetryProvider.readTelemetry()),
+                            perms = permissionsManager.checkSnapshot(),
+                            telemetry = telemetryProvider.readTelemetry()
+                        )
+                    }
+                    executePlanAndFollowUp(
+                        userPrompt = effectivePrompt,
+                        plan = quickOfflineCheck.plan,
+                        contextBundle = quickBundle,
+                        sourceMode = "${sourceMode}_OFFLINE",
+                        hadScreenVision = false
+                    )
+                    return@launch
+                }
+
                 // Handle "morning briefing" / "daily briefing" immediately without blocking on LLM
                 val lowerPrompt = effectivePrompt.lowercase()
                 if (lowerPrompt == "morning briefing" || lowerPrompt == "daily briefing" || lowerPrompt == "give me my briefing") {
@@ -1587,6 +1717,14 @@ class AgentOrchestrator private constructor(context: Context) {
                     _uiState.update { it.copy(visionInsightLabel = badge) }
                 }
 
+                // Inject recent System AssistStructure context when Accessibility overlay didn't produce a screen summary
+                if (screenSummary.isNullOrBlank() &&
+                    lastSystemAssistHint.isNotBlank() &&
+                    (android.os.SystemClock.elapsedRealtime() - lastSystemAssistAtMs) <= 25_000L
+                ) {
+                    screenSummary = lastSystemAssistHint
+                }
+
                 _uiState.update {
                     it.copy(
                         coreMode = CoreMode.THINKING,
@@ -1730,204 +1868,44 @@ class AgentOrchestrator private constructor(context: Context) {
     ) {
         val prefs = _uiState.value.preferences
         val accessibility = AetherAccessibilityService.currentInstance
-        val appMessageStep = findAppMessagingStep(plan.steps, accessibility != null)
+        val normalizedSteps = normalizePlanSteps(plan.steps, hasAccessibility = accessibility != null)
+        val hasDedicatedSocialOrMessage = normalizedSteps.any {
+            it.actionType == ActionType.POST_SOCIAL || it.actionType == ActionType.SEND_APP_MESSAGE
+        }
 
-        if (appMessageStep != null) {
-            val normalizedStep = if (appMessageStep.actionType == ActionType.SEND_APP_MESSAGE) {
-                appMessageStep
-            } else {
-                appMessageStep.copy(actionType = ActionType.SEND_APP_MESSAGE, isSensitive = false)
+        // Multi-Hop ReAct Workflow (e.g. YouTube channel -> Videos -> first video, multi-screen nav)
+        // Run any non-UI prerequisite steps through the unified DAG first instead of dropping them!
+        val isMultiHop = accessibility != null &&
+            !hasDedicatedSocialOrMessage &&
+            MultiStepGoalClassifier.isMultiHopAppWorkflow(userPrompt, plan)
+        if (isMultiHop) {
+            val prereqSteps = normalizedSteps.filter { step ->
+                step.actionType != ActionType.LAUNCH_APP &&
+                    step.actionType != ActionType.OPEN_SETTINGS &&
+                    step.actionType != ActionType.SEARCH_IN_APP &&
+                    step.actionType != ActionType.UI_TAP_TEXT &&
+                    step.actionType != ActionType.UI_TAP_COORDINATES &&
+                    step.actionType != ActionType.UI_INPUT_TEXT &&
+                    step.actionType != ActionType.UI_SCROLL &&
+                    step.actionType != ActionType.GLOBAL_ACTION &&
+                    step.actionType != ActionType.SPEAK_ONLY
             }
-            val otherSteps = plan.steps.filter { it !== appMessageStep }
-            if (otherSteps.isNotEmpty()) {
+            if (prereqSteps.isNotEmpty()) {
                 executeStepsPipeline(
                     userPrompt = userPrompt,
                     initialReply = plan.reply,
-                    steps = otherSteps,
+                    steps = prereqSteps,
                     bypassConfirmation = false,
                     sourceMode = sourceMode,
                     hadScreenVision = hadScreenVision,
-                    deferFinalSpeech = true
+                    deferFinalSpeech = true,
+                    contextBundle = contextBundle
                 )
             }
 
-            val taskId = "app_msg_0"
-            _uiState.update {
-                it.copy(
-                    coreMode = CoreMode.MULTITASKING,
-                    streamingReply = "",
-                    latestReply = "Starting autonomous messaging...",
-                    activeTasks = listOf(
-                        ActiveTaskItem(
-                            id = taskId,
-                            step = normalizedStep,
-                            status = TaskStatus.RUNNING,
-                            detail = "Starting..."
-                        )
-                    )
-                )
-            }
-
-            val startMs = System.currentTimeMillis()
-            val outcome = screenAutomationAgent.executeAppMessageGoal(
-                step = normalizedStep,
-                originalPrompt = userPrompt,
-                persona = prefs.persona,
-                deviceContextSummary = contextBundle.telemetryText,
-                memoriesSummary = contextBundle.memoriesText,
-                routinesSummary = contextBundle.routinesText,
-                contactsSummary = contextBundle.contactsText,
-                installedAppsSummary = contextBundle.appsText,
-                preferNvidiaPrimary = prefs.preferNvidiaPrimary,
-                splitScreenEnabled = prefs.splitScreenLaunchEnabled,
-                autoSend = prefs.autonomousModeEnabled,
-                onStepProgress = { progressLabel ->
-                    updateTaskStatus(
-                        taskId = taskId,
-                        status = TaskStatus.RUNNING,
-                        detail = progressLabel,
-                        elapsedMs = System.currentTimeMillis() - startMs,
-                        timedOut = false
-                    )
-                    _uiState.update { it.copy(latestReply = progressLabel) }
-                },
-                onStreamingReply = { partial ->
-                    _uiState.update { it.copy(streamingReply = partial) }
-                },
-                onActiveModelChanged = { label ->
-                    _uiState.update { it.copy(activeAiModelLabel = label) }
-                }
-            )
-            val elapsed = System.currentTimeMillis() - startMs
-            updateTaskStatus(
-                taskId = taskId,
-                status = if (outcome.success) TaskStatus.DONE else TaskStatus.FAILED,
-                detail = outcome.summary,
-                elapsedMs = elapsed,
-                timedOut = false
-            )
-
-            withContext(Dispatchers.IO) {
-                vaultRepository.insertLog(
-                    CommandLogEntity(
-                        userPrompt = userPrompt,
-                        assistantReply = outcome.summary,
-                        personaUsed = prefs.persona.displayName,
-                        sourceMode = sourceMode,
-                        hadScreenVision = true,
-                        tasksSummary = "${normalizedStep.label}: ${if (outcome.success) "DONE" else "FAILED"}",
-                        executionStatus = if (outcome.success) "EXECUTED" else "FAILED"
-                    )
-                )
-            }
-
-            recordConversationTurn(userPrompt, outcome.summary)
-            _uiState.update {
-                it.copy(
-                    streamingReply = "",
-                    latestReply = outcome.summary,
-                    coreMode = if (prefs.ttsEnabled) CoreMode.SPEAKING else CoreMode.IDLE,
-                    errorMessage = if (outcome.needsAccessibilityPermission) outcome.summary else null
-                )
-            }
-            if (prefs.ttsEnabled) {
-                voiceManager.speak(outcome.summary, prefs.persona, prefs.speechLocale)
-            } else {
-                maybeArmWakeWord()
-                resumeBackgroundCaptureIfNeeded()
-            }
-            return
-        }
-
-        // Autonomous Facebook / Social Post Flow
-        val socialPostStep = plan.steps.firstOrNull { it.actionType == ActionType.POST_SOCIAL }
-        if (socialPostStep != null) {
-            val taskId = "social_post_0"
-            _uiState.update {
-                it.copy(
-                    coreMode = CoreMode.MULTITASKING,
-                    streamingReply = "",
-                    latestReply = "Opening Facebook to publish post...",
-                    activeTasks = listOf(
-                        ActiveTaskItem(
-                            id = taskId,
-                            step = socialPostStep,
-                            status = TaskStatus.RUNNING,
-                            detail = "1/4 · Opening app..."
-                        )
-                    )
-                )
-            }
-            val startMs = System.currentTimeMillis()
-            val outcome = screenAutomationAgent.executeSocialPostGoal(
-                step = socialPostStep,
-                persona = prefs.persona,
-                deviceContextSummary = contextBundle.telemetryText,
-                memoriesSummary = contextBundle.memoriesText,
-                routinesSummary = contextBundle.routinesText,
-                contactsSummary = contextBundle.contactsText,
-                installedAppsSummary = contextBundle.appsText,
-                preferNvidiaPrimary = prefs.preferNvidiaPrimary,
-                splitScreenEnabled = prefs.splitScreenLaunchEnabled,
-                autoPost = prefs.autonomousModeEnabled,
-                onStepProgress = { progressLabel ->
-                    updateTaskStatus(
-                        taskId = taskId,
-                        status = TaskStatus.RUNNING,
-                        detail = progressLabel,
-                        elapsedMs = System.currentTimeMillis() - startMs,
-                        timedOut = false
-                    )
-                    _uiState.update { it.copy(latestReply = progressLabel) }
-                },
-                onStreamingReply = { partial -> _uiState.update { it.copy(streamingReply = partial) } },
-                onActiveModelChanged = { label -> _uiState.update { it.copy(activeAiModelLabel = label) } }
-            )
-            updateTaskStatus(
-                taskId = taskId,
-                status = if (outcome.success) TaskStatus.DONE else TaskStatus.FAILED,
-                detail = outcome.summary,
-                elapsedMs = System.currentTimeMillis() - startMs,
-                timedOut = false
-            )
-            withContext(Dispatchers.IO) {
-                vaultRepository.insertLog(
-                    CommandLogEntity(
-                        userPrompt = userPrompt,
-                        assistantReply = outcome.summary,
-                        personaUsed = prefs.persona.displayName,
-                        sourceMode = sourceMode,
-                        hadScreenVision = true,
-                        tasksSummary = "Post Social: ${if (outcome.success) "DONE" else "FAILED"}",
-                        executionStatus = if (outcome.success) "EXECUTED" else "FAILED"
-                    )
-                )
-            }
-            recordConversationTurn(userPrompt, outcome.summary)
-            _uiState.update {
-                it.copy(
-                    streamingReply = "",
-                    latestReply = outcome.summary,
-                    coreMode = if (prefs.ttsEnabled) CoreMode.SPEAKING else CoreMode.IDLE,
-                    errorMessage = if (outcome.needsAccessibilityPermission) outcome.summary else null
-                )
-            }
-            if (prefs.ttsEnabled) {
-                voiceManager.speak(outcome.summary, prefs.persona, prefs.speechLocale)
-            } else {
-                maybeArmWakeWord()
-                resumeBackgroundCaptureIfNeeded()
-            }
-            return
-        }
-
-        // Unified Multi-Hop ReAct Workflow (e.g. YouTube channel -> Videos -> first video, multi-screen nav)
-        val isMultiHop = accessibility != null &&
-            MultiStepGoalClassifier.isMultiHopAppWorkflow(userPrompt, plan)
-        if (isMultiHop) {
             val taskId = "react_workflow_0"
             val checklist = MultiStepGoalClassifier.deriveSubGoals(userPrompt, plan)
-            val reactPlaceholderStep = plan.steps.firstOrNull()
+            val reactPlaceholderStep = normalizedSteps.firstOrNull()
                 ?: PlannedStep(ActionType.LAUNCH_APP, "Multi-Step Goal", target = "")
             _uiState.update {
                 it.copy(
@@ -1938,13 +1916,11 @@ class AgentOrchestrator private constructor(context: Context) {
                     reActActiveSubGoalIndex = 0,
                     reActProgressLabel = "Preparing ${checklist.firstOrNull() ?: "workflow"}...",
                     reActWaitingForLoad = true,
-                    activeTasks = listOf(
-                        ActiveTaskItem(
-                            id = taskId,
-                            step = reactPlaceholderStep,
-                            status = TaskStatus.RUNNING,
-                            detail = checklist.firstOrNull() ?: "Running..."
-                        )
+                    activeTasks = it.activeTasks + ActiveTaskItem(
+                        id = taskId,
+                        step = reactPlaceholderStep,
+                        status = TaskStatus.RUNNING,
+                        detail = checklist.firstOrNull() ?: "Running..."
                     )
                 )
             }
@@ -1988,11 +1964,17 @@ class AgentOrchestrator private constructor(context: Context) {
                 onStreamingReply = { partial -> _uiState.update { it.copy(streamingReply = partial) } },
                 onActiveModelChanged = { label -> _uiState.update { it.copy(activeAiModelLabel = label) } }
             )
+            val reactDurationMs = System.currentTimeMillis() - startMs
+            distillAndPersistPlaybook(
+                userPrompt = userPrompt,
+                steps = normalizedSteps,
+                durationMs = reactDurationMs
+            )
             updateTaskStatus(
                 taskId = taskId,
                 status = TaskStatus.DONE,
                 detail = reactSummary,
-                elapsedMs = System.currentTimeMillis() - startMs,
+                elapsedMs = reactDurationMs,
                 timedOut = false
             )
             withContext(Dispatchers.IO) {
@@ -2028,102 +2010,64 @@ class AgentOrchestrator private constructor(context: Context) {
             return
         }
 
-        // Autonomous YouTube Search + Play First Result Flow (simple single video play)
-        val ytPlayStep = plan.steps.firstOrNull {
-            it.actionType == ActionType.PLAY_MEDIA &&
-                (it.target.contains("youtube", ignoreCase = true) ||
-                    userPrompt.contains("youtube", ignoreCase = true))
-        }
-        if (ytPlayStep != null && accessibility != null &&
-            !MultiStepGoalClassifier.isMultiHopYouTubeWorkflow(userPrompt, plan)
+        // Check self-learned App Playbook before heavy multi-screen social/media runs
+        if (accessibility != null && normalizedSteps.any {
+                it.actionType == ActionType.POST_SOCIAL || it.actionType == ActionType.LAUNCH_APP
+            }
         ) {
-            val taskId = "yt_play_0"
-            _uiState.update {
-                it.copy(
-                    coreMode = CoreMode.MULTITASKING,
-                    streamingReply = "",
-                    latestReply = "Opening YouTube...",
-                    activeTasks = listOf(
-                        ActiveTaskItem(
-                            id = taskId,
-                            step = ytPlayStep,
-                            status = TaskStatus.RUNNING,
-                            detail = "1/3 · Searching YouTube..."
-                        )
-                    )
-                )
-            }
-            val startMs = System.currentTimeMillis()
-            val outcome = screenAutomationAgent.executeYouTubePlayGoal(
-                step = ytPlayStep,
-                persona = prefs.persona,
-                deviceContextSummary = contextBundle.telemetryText,
-                memoriesSummary = contextBundle.memoriesText,
-                routinesSummary = contextBundle.routinesText,
-                contactsSummary = contextBundle.contactsText,
-                installedAppsSummary = contextBundle.appsText,
-                preferNvidiaPrimary = prefs.preferNvidiaPrimary,
-                splitScreenEnabled = prefs.splitScreenLaunchEnabled,
-                onStepProgress = { progressLabel ->
-                    updateTaskStatus(
-                        taskId = taskId,
-                        status = TaskStatus.RUNNING,
-                        detail = progressLabel,
-                        elapsedMs = System.currentTimeMillis() - startMs,
-                        timedOut = false
-                    )
-                    _uiState.update { it.copy(latestReply = progressLabel) }
-                },
-                onStreamingReply = { partial -> _uiState.update { it.copy(streamingReply = partial) } },
-                onActiveModelChanged = { label -> _uiState.update { it.copy(activeAiModelLabel = label) } }
+            val playbooks = withContext(Dispatchers.IO) { vaultRepository.getPlaybooksSnapshot() }
+            val matchedPlaybook = com.example.automation.PlaybookLearningEngine.findMatchingPlaybook(
+                userPrompt = userPrompt,
+                playbooks = playbooks
             )
-            updateTaskStatus(
-                taskId = taskId,
-                status = if (outcome.success) TaskStatus.DONE else TaskStatus.FAILED,
-                detail = outcome.summary,
-                elapsedMs = System.currentTimeMillis() - startMs,
-                timedOut = false
-            )
-            withContext(Dispatchers.IO) {
-                vaultRepository.insertLog(
-                    CommandLogEntity(
+            if (matchedPlaybook != null) {
+                val pbSteps = com.example.automation.PlaybookLearningEngine.compilePlaybookToPlannedSteps(matchedPlaybook)
+                if (pbSteps.isNotEmpty()) {
+                    _uiState.update {
+                        it.copy(matchedPlaybookLabel = "Playbook · ${matchedPlaybook.playbook.appLabel}")
+                    }
+                    val pbStart = System.currentTimeMillis()
+                    executeStepsPipeline(
                         userPrompt = userPrompt,
-                        assistantReply = outcome.summary,
-                        personaUsed = prefs.persona.displayName,
-                        sourceMode = sourceMode,
-                        hadScreenVision = true,
-                        tasksSummary = "YouTube Play: ${if (outcome.success) "DONE" else "FAILED"}",
-                        executionStatus = if (outcome.success) "EXECUTED" else "FAILED"
+                        initialReply = "Running learned playbook for ${matchedPlaybook.playbook.appLabel}...",
+                        steps = pbSteps,
+                        bypassConfirmation = true,
+                        sourceMode = "PLAYBOOK_REPLAY",
+                        hadScreenVision = false,
+                        deferFinalSpeech = false,
+                        contextBundle = contextBundle
                     )
-                )
+                    val pbFailed = _uiState.value.activeTasks.any {
+                        it.status == TaskStatus.FAILED || it.status == TaskStatus.TIMED_OUT
+                    }
+                    withContext(Dispatchers.IO) {
+                        if (pbFailed) {
+                            vaultRepository.recordPlaybookFailure(matchedPlaybook.playbook.id)
+                        } else {
+                            vaultRepository.recordPlaybookSuccess(
+                                matchedPlaybook.playbook.id,
+                                (System.currentTimeMillis() - pbStart).coerceAtLeast(150L)
+                            )
+                        }
+                    }
+                    if (!pbFailed) return
+                }
             }
-            recordConversationTurn(userPrompt, outcome.summary)
-            _uiState.update {
-                it.copy(
-                    streamingReply = "",
-                    latestReply = outcome.summary,
-                    coreMode = if (prefs.ttsEnabled) CoreMode.SPEAKING else CoreMode.IDLE
-                )
-            }
-            if (prefs.ttsEnabled) {
-                voiceManager.speak(outcome.summary, prefs.persona, prefs.speechLocale)
-            } else {
-                maybeArmWakeWord()
-                resumeBackgroundCaptureIfNeeded()
-            }
-            return
         }
 
+        // Unified Chained Cross-App DAG Execution:
+        // Runs background tools, SEND_APP_MESSAGE, POST_SOCIAL, YouTube PLAY_MEDIA, and UI steps together in one topological DAG.
         val willContinueLoop = plan.continueLoopAfterAction && accessibility != null
         val primaryAiReply = plan.reply.trim()
         executeStepsPipeline(
             userPrompt = userPrompt,
             initialReply = plan.reply,
-            steps = plan.steps,
+            steps = normalizedSteps,
             bypassConfirmation = false,
             sourceMode = sourceMode,
             hadScreenVision = hadScreenVision,
-            deferFinalSpeech = willContinueLoop
+            deferFinalSpeech = willContinueLoop,
+            contextBundle = contextBundle
         )
 
         if (willContinueLoop) {
@@ -2179,19 +2123,27 @@ class AgentOrchestrator private constructor(context: Context) {
         }
     }
 
-    private fun findAppMessagingStep(
+    private fun isAppMessagingStep(step: PlannedStep): Boolean {
+        if (step.actionType == ActionType.SEND_APP_MESSAGE) return true
+        if (step.actionType != ActionType.SEND_MESSAGE) return false
+        val appKeywords = listOf("whatsapp", "telegram", "messenger", "instagram", "signal", "viber")
+        return appKeywords.any { kw ->
+            step.target.contains(kw, ignoreCase = true) ||
+                step.label.contains(kw, ignoreCase = true)
+        }
+    }
+
+    private fun normalizePlanSteps(
         steps: List<PlannedStep>,
         hasAccessibility: Boolean
-    ): PlannedStep? {
-        steps.firstOrNull { it.actionType == ActionType.SEND_APP_MESSAGE }?.let { return it }
-        if (!hasAccessibility) return null
-        val appKeywords = listOf("whatsapp", "telegram", "messenger", "instagram", "signal", "viber")
-        return steps.firstOrNull { step ->
-            step.actionType == ActionType.SEND_MESSAGE &&
-                appKeywords.any { kw ->
-                    step.target.contains(kw, ignoreCase = true) ||
-                        step.label.contains(kw, ignoreCase = true)
-                }
+    ): List<PlannedStep> {
+        if (!hasAccessibility) return steps
+        return steps.map { step ->
+            if (step.actionType != ActionType.SEND_APP_MESSAGE && isAppMessagingStep(step)) {
+                step.copy(actionType = ActionType.SEND_APP_MESSAGE, isSensitive = false)
+            } else {
+                step
+            }
         }
     }
 
@@ -2202,7 +2154,8 @@ class AgentOrchestrator private constructor(context: Context) {
         bypassConfirmation: Boolean,
         sourceMode: String,
         hadScreenVision: Boolean,
-        deferFinalSpeech: Boolean = false
+        deferFinalSpeech: Boolean = false,
+        contextBundle: ContextSnapshotBundle? = null
     ) {
         val prefs = _uiState.value.preferences
         val guardedNeeded = !prefs.autonomousModeEnabled && !bypassConfirmation && steps.any { it.isSensitive }
@@ -2251,6 +2204,9 @@ class AgentOrchestrator private constructor(context: Context) {
         val preferBangla = userPrompt.any { it in '\u0980'..'\u09FF' } ||
             listOf("bristi", "abohawa", "ajke", "kemon", "hobe", "koro", "amar", "thakbe", "korbe")
                 .any { lowerPrompt.contains(it) }
+        val hasAccessibility = AetherAccessibilityService.currentInstance != null
+        val isSingleYouTubeWorkflow = !MultiStepGoalClassifier.isMultiHopYouTubeWorkflow(userPrompt, null)
+        val accessibilityErrorHint = java.util.concurrent.atomic.AtomicReference<String?>(null)
 
         val dagSummary = dagExecutor.executeDag(
             nodes = dagNodes,
@@ -2269,16 +2225,132 @@ class AgentOrchestrator private constructor(context: Context) {
                 } else {
                     step
                 }
-                actionRouter.executeStep(adjustedStep, prefs.splitScreenLaunchEnabled)
+                val stepStartMs = System.currentTimeMillis()
+                val telemetryText = contextBundle?.telemetryText ?: ""
+                val memoriesText = contextBundle?.memoriesText ?: ""
+                val routinesText = contextBundle?.routinesText ?: ""
+                val contactsText = contextBundle?.contactsText ?: ""
+                val appsText = contextBundle?.appsText ?: ""
+
+                when {
+                    adjustedStep.actionType == ActionType.SEND_APP_MESSAGE -> {
+                        val outcome = screenAutomationAgent.executeAppMessageGoal(
+                            step = adjustedStep,
+                            originalPrompt = userPrompt,
+                            persona = prefs.persona,
+                            deviceContextSummary = telemetryText,
+                            memoriesSummary = memoriesText,
+                            routinesSummary = routinesText,
+                            contactsSummary = contactsText,
+                            installedAppsSummary = appsText,
+                            preferNvidiaPrimary = prefs.preferNvidiaPrimary,
+                            splitScreenEnabled = prefs.splitScreenLaunchEnabled,
+                            autoSend = prefs.autonomousModeEnabled,
+                            onStepProgress = { progressLabel ->
+                                updateTaskStatus(
+                                    taskId = adjustedStep.stepId,
+                                    status = TaskStatus.RUNNING,
+                                    detail = progressLabel,
+                                    elapsedMs = System.currentTimeMillis() - stepStartMs,
+                                    timedOut = false
+                                )
+                                _uiState.update { it.copy(latestReply = progressLabel) }
+                            },
+                            onStreamingReply = { partial -> _uiState.update { it.copy(streamingReply = partial) } },
+                            onActiveModelChanged = { label -> _uiState.update { it.copy(activeAiModelLabel = label) } }
+                        )
+                        if (outcome.needsAccessibilityPermission) {
+                            accessibilityErrorHint.set(outcome.summary)
+                        }
+                        com.example.system.ActionExecutionResult(
+                            success = outcome.success,
+                            detail = outcome.summary,
+                            toolOutputForSummary = outcome.summary
+                        )
+                    }
+
+                    adjustedStep.actionType == ActionType.POST_SOCIAL -> {
+                        val outcome = screenAutomationAgent.executeSocialPostGoal(
+                            step = adjustedStep,
+                            persona = prefs.persona,
+                            deviceContextSummary = telemetryText,
+                            memoriesSummary = memoriesText,
+                            routinesSummary = routinesText,
+                            contactsSummary = contactsText,
+                            installedAppsSummary = appsText,
+                            preferNvidiaPrimary = prefs.preferNvidiaPrimary,
+                            splitScreenEnabled = prefs.splitScreenLaunchEnabled,
+                            autoPost = prefs.autonomousModeEnabled,
+                            onStepProgress = { progressLabel ->
+                                updateTaskStatus(
+                                    taskId = adjustedStep.stepId,
+                                    status = TaskStatus.RUNNING,
+                                    detail = progressLabel,
+                                    elapsedMs = System.currentTimeMillis() - stepStartMs,
+                                    timedOut = false
+                                )
+                                _uiState.update { it.copy(latestReply = progressLabel) }
+                            },
+                            onStreamingReply = { partial -> _uiState.update { it.copy(streamingReply = partial) } },
+                            onActiveModelChanged = { label -> _uiState.update { it.copy(activeAiModelLabel = label) } }
+                        )
+                        if (outcome.needsAccessibilityPermission) {
+                            accessibilityErrorHint.set(outcome.summary)
+                        }
+                        com.example.system.ActionExecutionResult(
+                            success = outcome.success,
+                            detail = outcome.summary,
+                            toolOutputForSummary = outcome.summary
+                        )
+                    }
+
+                    hasAccessibility &&
+                        isSingleYouTubeWorkflow &&
+                        adjustedStep.actionType == ActionType.PLAY_MEDIA &&
+                        (adjustedStep.target.contains("youtube", ignoreCase = true) ||
+                            userPrompt.contains("youtube", ignoreCase = true)) -> {
+                        val outcome = screenAutomationAgent.executeYouTubePlayGoal(
+                            step = adjustedStep,
+                            persona = prefs.persona,
+                            deviceContextSummary = telemetryText,
+                            memoriesSummary = memoriesText,
+                            routinesSummary = routinesText,
+                            contactsSummary = contactsText,
+                            installedAppsSummary = appsText,
+                            preferNvidiaPrimary = prefs.preferNvidiaPrimary,
+                            splitScreenEnabled = prefs.splitScreenLaunchEnabled,
+                            onStepProgress = { progressLabel ->
+                                updateTaskStatus(
+                                    taskId = adjustedStep.stepId,
+                                    status = TaskStatus.RUNNING,
+                                    detail = progressLabel,
+                                    elapsedMs = System.currentTimeMillis() - stepStartMs,
+                                    timedOut = false
+                                )
+                                _uiState.update { it.copy(latestReply = progressLabel) }
+                            },
+                            onStreamingReply = { partial -> _uiState.update { it.copy(streamingReply = partial) } },
+                            onActiveModelChanged = { label -> _uiState.update { it.copy(activeAiModelLabel = label) } }
+                        )
+                        com.example.system.ActionExecutionResult(
+                            success = outcome.success,
+                            detail = outcome.summary,
+                            toolOutputForSummary = outcome.summary
+                        )
+                    }
+
+                    else -> actionRouter.executeStep(adjustedStep, prefs.splitScreenLaunchEnabled)
+                }
             }
         )
 
         val toolOutputs = dagSummary.toolOutputs
         val finalReply = if (toolOutputs.isNotEmpty()) {
+            val onlySingleForegroundAgentOutput = dagNodes.size == 1 && toolOutputs.size == 1
             val onlyBackgroundOutputs = dagNodes.none {
                 !it.step.isBackgroundParallel && it.step.actionType != ActionType.SPEAK_ONLY
             }
-            if (toolOutputs.size == 1 && onlyBackgroundOutputs) {
+            if (onlySingleForegroundAgentOutput || (toolOutputs.size == 1 && onlyBackgroundOutputs)) {
                 toolOutputs.first()
             } else {
                 geminiService.synthesizeToolSummary(
@@ -2307,6 +2379,13 @@ class AgentOrchestrator private constructor(context: Context) {
             it.status == TaskStatus.FAILED || it.status == TaskStatus.TIMED_OUT || it.status == TaskStatus.SKIPPED
         }
         val summaryStr = finalTasks.joinToString(" | ") { "${it.step.label}: ${it.status.name}" }
+        val usedUiAgent = hadScreenVision || dagNodes.any {
+            it.step.actionType == ActionType.POST_SOCIAL ||
+                it.step.actionType == ActionType.SEND_APP_MESSAGE ||
+                it.step.actionType == ActionType.UI_TAP_TEXT ||
+                it.step.actionType == ActionType.UI_TAP_COORDINATES ||
+                it.step.actionType == ActionType.UI_INPUT_TEXT
+        }
 
         if (!deferFinalSpeech) {
             withContext(Dispatchers.IO) {
@@ -2316,7 +2395,7 @@ class AgentOrchestrator private constructor(context: Context) {
                         assistantReply = finalReply,
                         personaUsed = prefs.persona.displayName,
                         sourceMode = sourceMode,
-                        hadScreenVision = hadScreenVision,
+                        hadScreenVision = usedUiAgent,
                         tasksSummary = summaryStr,
                         executionStatus = if (allFailed) "FAILED" else "EXECUTED"
                     )
@@ -2325,10 +2404,13 @@ class AgentOrchestrator private constructor(context: Context) {
             recordConversationTurn(userPrompt, finalReply)
         }
 
+        val shouldRequestLens = dagNodes.any { it.step.actionType == ActionType.OPEN_CAMERA_LENS }
         _uiState.update {
             it.copy(
                 streamingReply = "",
                 latestReply = finalReply,
+                errorMessage = accessibilityErrorHint.get(),
+                cameraLensRequested = if (shouldRequestLens) true else it.cameraLensRequested,
                 coreMode = if (!deferFinalSpeech && prefs.ttsEnabled) CoreMode.SPEAKING else CoreMode.IDLE
             )
         }
@@ -2339,6 +2421,241 @@ class AgentOrchestrator private constructor(context: Context) {
             } else {
                 maybeArmWakeWord()
                 resumeBackgroundCaptureIfNeeded()
+            }
+        }
+
+        // Persist learned playbook after successful multi-step UI or social execution
+        if (!allFailed && sourceMode != "PLAYBOOK_REPLAY" &&
+            dagNodes.any { it.step.actionType == ActionType.POST_SOCIAL || it.step.actionType == ActionType.SEND_APP_MESSAGE }
+        ) {
+            val totalElapsed = finalTasks.sumOf { it.elapsedMs }.coerceAtLeast(800L)
+            distillAndPersistPlaybook(
+                userPrompt = userPrompt,
+                steps = dagNodes.map { it.step },
+                durationMs = totalElapsed
+            )
+        }
+    }
+
+    // ---- Notification Copilot, CameraX Live Lens, Playbook Learning & Auto-Triggers ----
+
+    fun speakNotificationDigest() {
+        val prefs = _uiState.value.preferences
+        val preferBangla = prefs.speechLocale == com.example.ai.SpeechLocaleOption.BN_BD
+        val digest = com.example.notifications.NotificationCopilotStore.buildSpokenDigest(preferBangla = preferBangla)
+        _uiState.update {
+            it.copy(
+                latestReply = digest,
+                coreMode = if (prefs.ttsEnabled) CoreMode.SPEAKING else CoreMode.IDLE
+            )
+        }
+        if (prefs.ttsEnabled) {
+            voiceManager.speak(digest, prefs.persona, prefs.speechLocale)
+        }
+    }
+
+    fun replyToNotificationCluster(clusterId: String, replyText: String) {
+        val res = com.example.notifications.NotificationCopilotStore.dispatchRemoteReply(
+            context = appContext,
+            clusterId = clusterId,
+            replyText = replyText
+        )
+        val prefs = _uiState.value.preferences
+        res.onSuccess { confirmation ->
+            _uiState.update {
+                it.copy(
+                    latestReply = confirmation,
+                    errorMessage = null,
+                    coreMode = if (prefs.ttsEnabled) CoreMode.SPEAKING else CoreMode.IDLE
+                )
+            }
+            if (prefs.ttsEnabled) {
+                voiceManager.speak(confirmation, prefs.persona, prefs.speechLocale)
+            }
+        }.onFailure { err ->
+            _uiState.update {
+                it.copy(errorMessage = err.localizedMessage ?: "Failed to send notification reply.")
+            }
+        }
+    }
+
+    fun dismissNotificationCluster(clusterId: String) {
+        com.example.notifications.NotificationCopilotStore.dismissCluster(clusterId)
+    }
+
+    fun clearAllNotifications() {
+        com.example.notifications.NotificationCopilotStore.clearAll()
+    }
+
+    fun clearCameraLensRequest() {
+        _uiState.update { it.copy(cameraLensRequested = false) }
+    }
+
+    fun analyzeCameraLensFrame(bitmap: Bitmap, question: String) {
+        val cleanQuestion = question.trim().ifBlank {
+            "Identify what is in front of the camera, read any visible text cleanly, and answer briefly."
+        }
+        cameraLensEngine.setAnalyzingAnswer(true, cleanQuestion)
+        scope.launch {
+            val prefs = _uiState.value.preferences
+            val processed = withContext(Dispatchers.Default) {
+                visionProcessor.processScreenForVision(
+                    sourceBitmap = bitmap,
+                    prompt = cleanQuestion,
+                    accessibilityNodeCount = 0,
+                    forceOcrFallback = true,
+                    visionTokenMode = com.example.data.local.VisionTokenMode.CLOUD_VISION,
+                    forceCloudEscalation = true
+                )
+            }
+            val visionPrompt = buildString {
+                appendLine("LIVE CAMERA LENS QA:")
+                appendLine("Analyze the attached camera snapshot and answer the user's question concisely in 1-3 natural sentences matching the user's language (English or Bangla).")
+                val liveLabels = _uiState.value.lensCueState.liveLabels
+                if (liveLabels.isNotEmpty()) {
+                    appendLine("Detected scene objects: ${liveLabels.joinToString(", ")}")
+                }
+                appendLine("Question: $cleanQuestion")
+            }
+            val result = geminiService.planCommand(
+                userPrompt = visionPrompt,
+                persona = prefs.persona,
+                deviceContextSummary = telemetryProvider.buildPromptTelemetrySummary(telemetryProvider.readTelemetry()),
+                memoriesSummary = "",
+                routinesSummary = "",
+                contactsSummary = "",
+                installedAppsSummary = "",
+                screenUiSummary = "Camera Lens Live Capture",
+                screenBitmap = processed.croppedBitmap ?: bitmap,
+                ocrSummary = processed.ocrSummary.ifBlank { null },
+                preferNvidiaPrimary = prefs.preferNvidiaPrimary,
+                onActiveModelChanged = { lbl -> _uiState.update { it.copy(activeAiModelLabel = lbl) } }
+            )
+            if (processed.ownsCroppedBitmap) {
+                runCatching { processed.croppedBitmap?.recycle() }
+            }
+            val answer = result.fold(
+                onSuccess = { plan ->
+                    plan.reply.ifBlank {
+                        processed.ocrSummary.takeIf { it.isNotBlank() } ?: "Analyzed camera frame."
+                    }
+                },
+                onFailure = { err ->
+                    val ocrFallback = processed.ocrSummary
+                    if (ocrFallback.isNotBlank()) {
+                        "Offline OCR detected: $ocrFallback"
+                    } else {
+                        err.localizedMessage ?: "Could not analyze image right now."
+                    }
+                }
+            )
+            cameraLensEngine.publishVisionAnswer(cleanQuestion, answer)
+            _uiState.update {
+                it.copy(
+                    lastUserPrompt = "Lens: $cleanQuestion",
+                    latestReply = answer,
+                    coreMode = if (prefs.ttsEnabled) CoreMode.SPEAKING else CoreMode.IDLE
+                )
+            }
+            if (prefs.ttsEnabled) {
+                voiceManager.speak(answer, prefs.persona, prefs.speechLocale)
+            }
+        }
+    }
+
+    fun replayPlaybook(playbook: com.example.data.local.AppPlaybookEntity) {
+        val pbSteps = com.example.automation.PlaybookLearningEngine.compilePlaybookToPlannedSteps(
+            com.example.automation.PlaybookMatch(
+                playbook = playbook,
+                steps = com.example.automation.PlaybookLearningEngine.decodeStepsJson(playbook.stepsJson),
+                slotBindings = emptyMap(),
+                confidenceScore = 1f
+            )
+        )
+        if (pbSteps.isEmpty()) return
+        activeExecutionJob?.cancel()
+        activeExecutionJob = scope.launch {
+            val start = System.currentTimeMillis()
+            executeStepsPipeline(
+                userPrompt = "Run Playbook: ${playbook.appLabel} (${playbook.intentPattern})",
+                initialReply = "Running learned ${playbook.appLabel} playbook...",
+                steps = pbSteps,
+                bypassConfirmation = true,
+                sourceMode = "PLAYBOOK_REPLAY",
+                hadScreenVision = false
+            )
+            withContext(Dispatchers.IO) {
+                vaultRepository.recordPlaybookSuccess(playbook.id, System.currentTimeMillis() - start)
+            }
+        }
+    }
+
+    private suspend fun distillAndPersistPlaybook(
+        userPrompt: String,
+        steps: List<PlannedStep>,
+        durationMs: Long
+    ) {
+        val pbSteps = steps.mapNotNull { s ->
+            when (s.actionType) {
+                ActionType.LAUNCH_APP -> com.example.automation.PlaybookStep("LAUNCH", s.target)
+                ActionType.POST_SOCIAL -> com.example.automation.PlaybookStep("LAUNCH", s.target.ifBlank { "Facebook" })
+                ActionType.UI_TAP_TEXT -> com.example.automation.PlaybookStep("TAP_TEXT", s.target)
+                ActionType.UI_INPUT_TEXT -> com.example.automation.PlaybookStep("INPUT", s.target, slotKey = "postText", literalFallback = s.textPayload)
+                ActionType.UI_TAP_COORDINATES -> com.example.automation.PlaybookStep("TAP_COORDS", normX = s.intValue, normY = s.secondaryIntValue)
+                ActionType.UI_SCROLL -> com.example.automation.PlaybookStep("SCROLL", s.target.ifBlank { "down" })
+                else -> null
+            }
+        }
+        if (pbSteps.isEmpty()) return
+        val appHint = steps.firstOrNull { it.target.isNotBlank() }?.target ?: ""
+        val candidate = com.example.automation.PlaybookLearningEngine.distillPlaybook(
+            appPackage = "",
+            appLabel = appHint,
+            userPrompt = userPrompt,
+            rawSteps = pbSteps,
+            durationMs = durationMs
+        )
+        withContext(Dispatchers.IO) {
+            val existing = vaultRepository.getPlaybooksSnapshot().firstOrNull {
+                it.appPackage == candidate.appPackage && it.intentPattern == candidate.intentPattern
+            }
+            if (existing != null) {
+                vaultRepository.recordPlaybookSuccess(existing.id, durationMs)
+            } else {
+                vaultRepository.savePlaybook(candidate)
+            }
+        }
+    }
+
+    fun testTriggerRuleNow(rule: com.example.data.local.SmartTriggerRuleEntity) {
+        scope.launch {
+            handleTriggeredRule(
+                rule = rule,
+                event = com.example.automation.ContextTriggerEvent(rule.triggerType, "Manual Test")
+            )
+        }
+    }
+
+    private suspend fun handleTriggeredRule(
+        rule: com.example.data.local.SmartTriggerRuleEntity,
+        event: com.example.automation.ContextTriggerEvent
+    ) {
+        withContext(Dispatchers.IO) {
+            vaultRepository.recordTriggerFired(rule.id)
+        }
+        val label = "${rule.name} (${event.detailValue.ifBlank { event.type }})"
+        withContext(Dispatchers.Main) {
+            _uiState.update { it.copy(lastAutoTriggerLabel = label) }
+            if (rule.actionMode == "SPEAK_NOTIFICATION_DIGEST") {
+                val clusters = _uiState.value.unreadNotifications
+                if (clusters.isNotEmpty() || event.detailValue == "Manual Test") {
+                    speakNotificationDigest()
+                }
+            } else if (rule.actionPayload.isNotBlank()) {
+                submitCommand(
+                    prompt = rule.actionPayload,
+                    sourceMode = "AUTO_TRIGGER"
+                )
             }
         }
     }

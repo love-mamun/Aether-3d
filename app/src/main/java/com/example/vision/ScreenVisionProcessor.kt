@@ -157,7 +157,8 @@ class ScreenVisionProcessor(
         anchorRect: Rect? = null,
         packageName: String = "",
         rawUiSummary: String = "",
-        visionTokenMode: VisionTokenMode = VisionTokenMode.OFFLINE_FIRST
+        visionTokenMode: VisionTokenMode = VisionTokenMode.OFFLINE_FIRST,
+        forceCloudEscalation: Boolean = false
     ): ProcessedVisionContext = withContext(Dispatchers.Default) {
         if (sourceBitmap == null) {
             val offlineOnly = offlineEngine.analyzeBitmapAndUi(
@@ -168,7 +169,8 @@ class ScreenVisionProcessor(
                 ocrLines = emptyList(),
                 ocrSummary = "",
                 userPrompt = prompt,
-                visionTokenMode = visionTokenMode
+                visionTokenMode = visionTokenMode,
+                forceCloudEscalation = forceCloudEscalation
             )
             return@withContext ProcessedVisionContext(
                 croppedBitmap = null,
@@ -214,7 +216,8 @@ class ScreenVisionProcessor(
             ocrLines = ocr.lines,
             ocrSummary = ocr.summaryText,
             userPrompt = prompt,
-            visionTokenMode = visionTokenMode
+            visionTokenMode = visionTokenMode,
+            forceCloudEscalation = forceCloudEscalation
         )
 
         val bitmapForCloud: Bitmap?

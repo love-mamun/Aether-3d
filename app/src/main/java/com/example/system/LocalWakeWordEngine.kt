@@ -344,8 +344,10 @@ class LocalWakeWordEngine(
         ) == PackageManager.PERMISSION_GRANTED
         if (!micGranted) return
 
-        stopPassiveMonitor()
+        val previousJob = monitorJob
         monitorJob = scope.launch {
+            runCatching { previousJob?.cancel() }
+            runCatching { previousJob?.join() }
             val installed = findInstalledModelFiles()
             val sampleRate = 16_000
             val minBuf = AudioRecord.getMinBufferSize(
@@ -357,7 +359,20 @@ class LocalWakeWordEngine(
             var activeSpotter: KeywordSpotter? = null
             if (installed != null) {
                 activeSpotter = runCatching {
+                    val modelFilesValid = File(installed.encoderPath).length() > 1024L &&
+                        File(installed.decoderPath).length() > 1024L &&
+                        File(installed.joinerPath).length() > 1024L &&
+                        File(installed.tokensPath).length() > 0L
+                    if (!modelFilesValid) {
+                        throw IllegalStateException("Sherpa KWS model files incomplete")
+                    }
                     val runtimeKeywordsPath = buildRuntimeKeywordsFile(installed, customWakePhrase, persona)
+                    val hasKeywords = runCatching {
+                        File(runtimeKeywordsPath).readLines().any { it.isNotBlank() }
+                    }.getOrDefault(false)
+                    if (!hasKeywords) {
+                        throw IllegalStateException("Runtime keywords file empty")
+                    }
                     val cfg = KeywordSpotterConfig().apply {
                         featConfig = FeatureConfig(sampleRate = sampleRate, featureDim = 80, dither = 0f)
                         modelConfig = OnlineModelConfig(

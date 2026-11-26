@@ -1,8 +1,12 @@
 package com.example.ui
 
+import android.Manifest
+import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -28,6 +32,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -36,12 +41,15 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.data.local.BiometricVaultHelper
+import com.example.ui.components.CameraLensOverlaySheet
 import com.example.ui.components.CoreStatusAndReplyOverlay
+import com.example.ui.components.NotificationCopilotSheet
 import com.example.ui.components.NvidiaApiDialog
 import com.example.ui.components.PermissionsWizardSheet
 import com.example.ui.components.SettingsHubSheet
 import com.example.ui.components.TacticalCornerReticles
 import com.example.ui.components.TopTelemetryBar
+import com.example.ui.components.UnreadDigestPill
 import com.example.ui.components.VaultBottomSheet
 import com.example.ui.components.VaultWorkspaceContent
 import com.example.ui.components.VoiceDock
@@ -63,12 +71,16 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
     val contacts by viewModel.quickContacts.collectAsStateWithLifecycle()
     val reminders by viewModel.reminders.collectAsStateWithLifecycle()
     val macros by viewModel.macros.collectAsStateWithLifecycle()
+    val playbooks by viewModel.playbooks.collectAsStateWithLifecycle()
+    val triggerRules by viewModel.triggerRules.collectAsStateWithLifecycle()
 
     var showPermissionsWizard by remember { mutableStateOf(false) }
     var showVaultSheet by remember { mutableStateOf(false) }
     var showNvidiaApiDialog by remember { mutableStateOf(false) }
     var showVoiceStudio by remember { mutableStateOf(false) }
     var showSettingsHub by remember { mutableStateOf(false) }
+    var showNotificationCopilot by remember { mutableStateOf(false) }
+    var showCameraLens by remember { mutableStateOf(false) }
     var biometricError by remember { mutableStateOf<String?>(null) }
 
     val triggerBiometricUnlock = remember(activity) {
@@ -99,9 +111,16 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
         }
     }
 
+    LaunchedEffect(uiState.cameraLensRequested) {
+        if (uiState.cameraLensRequested) {
+            showCameraLens = true
+            viewModel.clearCameraLensRequest()
+        }
+    }
+
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         viewModel.refreshPermissionsAndTelemetry()
-        if (uiState.backgroundServiceActive) {
+        if (uiState.backgroundServiceActive && !com.example.service.VoiceAgentService.isServiceRunning) {
             runCatching { com.example.service.VoiceAgentService.start(context) }
         }
     }
@@ -117,6 +136,23 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) {
         viewModel.refreshPermissionsAndTelemetry()
+    }
+
+    val cameraPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) {
+        viewModel.refreshPermissionsAndTelemetry()
+    }
+
+    val lensPhotoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia()
+    ) { uri ->
+        if (uri != null) {
+            viewModel.analyzeCameraLensUri(
+                uri = uri,
+                question = "Identify objects, read visible text, and summarize this photo concisely."
+            )
+        }
     }
 
     val wavSamplePickerLauncher = rememberLauncherForActivityResult(
@@ -183,8 +219,15 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
         }
     }
 
-    BackHandler(enabled = showSettingsHub || showPermissionsWizard || showVaultSheet || showNvidiaApiDialog || showVoiceStudio) {
+    BackHandler(
+        enabled = showCameraLens || showNotificationCopilot || showSettingsHub || showPermissionsWizard || showVaultSheet || showNvidiaApiDialog || showVoiceStudio
+    ) {
         when {
+            showCameraLens -> {
+                viewModel.cameraLensEngine.unbind()
+                showCameraLens = false
+            }
+            showNotificationCopilot -> showNotificationCopilot = false
             showVoiceStudio -> showVoiceStudio = false
             showNvidiaApiDialog -> showNvidiaApiDialog = false
             showPermissionsWizard -> showPermissionsWizard = false
@@ -248,8 +291,22 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
                             }
                         },
                         onOpenApiSettings = { showNvidiaApiDialog = true },
-                        onOpenVoiceStudio = { showVoiceStudio = true }
+                        onOpenVoiceStudio = { showVoiceStudio = true },
+                        onOpenCameraLens = { showCameraLens = true }
                     )
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.Center
+                    ) {
+                        UnreadDigestPill(
+                            clusters = uiState.unreadNotifications,
+                            listenerConnected = uiState.notificationListenerConnected,
+                            onOpenCopilot = { showNotificationCopilot = true }
+                        )
+                    }
 
                     Spacer(Modifier.weight(1f))
 
@@ -353,7 +410,11 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
                         macroStepCount = uiState.macroStepCount,
                         onToggleMacroRecording = { name -> viewModel.toggleMacroRecording(name) },
                         onReplayMacro = { macro -> viewModel.replayMacro(macro) },
-                        onDeleteMacro = { id -> viewModel.deleteMacro(id) }
+                        onDeleteMacro = { id -> viewModel.deleteMacro(id) },
+                        playbooks = playbooks,
+                        onTogglePlaybookPinned = { pb -> viewModel.togglePlaybookPinned(pb) },
+                        onReplayPlaybook = { pb -> viewModel.replayPlaybook(pb) },
+                        onDeletePlaybook = { id -> viewModel.deletePlaybook(id) }
                     )
                 }
             }
@@ -406,7 +467,11 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
                 macroStepCount = uiState.macroStepCount,
                 onToggleMacroRecording = { name -> viewModel.toggleMacroRecording(name) },
                 onReplayMacro = { macro -> viewModel.replayMacro(macro) },
-                onDeleteMacro = { id -> viewModel.deleteMacro(id) }
+                onDeleteMacro = { id -> viewModel.deleteMacro(id) },
+                playbooks = playbooks,
+                onTogglePlaybookPinned = { pb -> viewModel.togglePlaybookPinned(pb) },
+                onReplayPlaybook = { pb -> viewModel.replayPlaybook(pb) },
+                onDeletePlaybook = { id -> viewModel.deletePlaybook(id) }
             )
         }
 
@@ -468,7 +533,14 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
                 onDownloadKwsPack = { viewModel.downloadKwsPack() },
                 onToggleDeepScreenVision = triggerDeepScreenVisionToggle,
                 onRequestDefaultAssistant = triggerDefaultAssistantRequest,
-                onSelectVisionTokenMode = { viewModel.setVisionTokenMode(it) }
+                onSelectVisionTokenMode = { viewModel.setVisionTokenMode(it) },
+                triggerRules = triggerRules,
+                onToggleTriggerRule = { id, en -> viewModel.toggleTriggerRule(id, en) },
+                onTestTriggerRule = { rule -> viewModel.testTriggerRule(rule) },
+                onDeleteTriggerRule = { id -> viewModel.deleteTriggerRule(id) },
+                onAddTriggerRule = { name, type, cond, mode, payload, cooldown ->
+                    viewModel.addTriggerRule(name, type, cond, mode, payload, cooldown)
+                }
             )
         }
 
@@ -510,6 +582,49 @@ fun AetherCockpitScreen(viewModel: JarvisViewModel) {
                 onFetchModels = { overrideKey ->
                     viewModel.fetchLiveNvidiaModels(overrideKey)
                 }
+            )
+        }
+
+        if (showNotificationCopilot) {
+            NotificationCopilotSheet(
+                clusters = uiState.unreadNotifications,
+                listenerEnabled = uiState.permissionSnapshot.notificationAccessGranted,
+                onDismiss = { showNotificationCopilot = false },
+                onRequestNotificationPermission = {
+                    runCatching {
+                        context.startActivity(
+                            viewModel.permissionsManager.buildSpecialSettingsIntent("notification_listener")
+                        )
+                    }
+                },
+                onSpeakDigest = { viewModel.speakNotificationDigest() },
+                onSendReply = { clusterId, text -> viewModel.replyToNotification(clusterId, text) },
+                onDismissCluster = { clusterId -> viewModel.dismissNotification(clusterId) },
+                onClearAll = { viewModel.clearAllNotifications() }
+            )
+        }
+
+        if (showCameraLens) {
+            val hasCameraPerm = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
+            CameraLensOverlaySheet(
+                cameraEngine = viewModel.cameraLensEngine,
+                cueState = uiState.lensCueState,
+                hasCameraPermission = hasCameraPerm,
+                onRequestCameraPermission = {
+                    cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                },
+                onPickPhotoClick = {
+                    lensPhotoPickerLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                    )
+                },
+                onAnalyzeCapturedBitmap = { bitmap, q ->
+                    viewModel.analyzeCameraLensBitmap(bitmap, q)
+                },
+                onDismiss = { showCameraLens = false }
             )
         }
     }

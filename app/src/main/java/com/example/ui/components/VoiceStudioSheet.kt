@@ -455,6 +455,37 @@ fun VoiceStudioContent(
                     )
                 }
             }
+            Spacer(Modifier.height(8.dp))
+            val downloadedCount = uiState.voicePacks.count { it.status == VoicePackStatus.READY }
+            val installedMb = uiState.voicePacks
+                .filter { it.status == VoicePackStatus.READY }
+                .sumOf { it.pack.downloadSizeMb.toDouble() }
+                .toFloat()
+            Surface(
+                color = SmokedGlass,
+                shape = RoundedCornerShape(12.dp),
+                border = BorderStroke(1.dp, accent.copy(alpha = 0.35f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("in_app_download_hub_card")
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp)) {
+                    Text(
+                        text = "IN-APP DOWNLOAD HUB · Lightweight APK",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = accent
+                    )
+                    Text(
+                        text = if (downloadedCount == 0) {
+                            "System TTS is active out of the box (~0 MB). Download offline neural voice packs below anytime."
+                        } else {
+                            "$downloadedCount offline voice pack${if (downloadedCount > 1) "s" else ""} installed (~${installedMb.toInt()} MB)"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = HudTextSecondary
+                    )
+                }
+            }
         }
 
         items(uiState.voicePacks, key = { it.pack.id }) { packState ->
@@ -530,7 +561,7 @@ private fun NeuralVoicePackCard(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    val sizeNote = if (pack.isBundledAsset) "Starter Offline" else "~${pack.downloadSizeMb.toInt()} MB"
+                    val sizeNote = if (pack.downloadSizeMb > 0f) "~${pack.downloadSizeMb.toInt()} MB" else "User Import"
                     val ownerTag = if (ownerLabel.isNotBlank()) " · Active: $ownerLabel" else ""
                     Text(
                         text = "${pack.languageTag} · ${pack.genderHint} · $sizeNote$ownerTag",

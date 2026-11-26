@@ -41,7 +41,14 @@ class ScreenVisionService : Service() {
         } else {
             0
         }
-        ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, fgsType)
+        val fgOk = runCatching {
+            ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, fgsType)
+            true
+        }.getOrDefault(false)
+        if (!fgOk) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
 
         if (intent?.action == ACTION_START_VISION) {
             val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
@@ -52,14 +59,16 @@ class ScreenVisionService : Service() {
                 intent.getParcelableExtra(EXTRA_RESULT_DATA)
             }
             if (resultCode == Activity.RESULT_OK && resultData != null) {
-                val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-                val projection = mgr.getMediaProjection(resultCode, resultData)
+                val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as? MediaProjectionManager
+                val projection = runCatching { mgr?.getMediaProjection(resultCode, resultData) }.getOrNull()
                 if (projection != null) {
                     MediaProjectionScreenGrabber.attachProjection(projection, applicationContext)
                 } else {
+                    ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 }
             } else {
+                ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
         }

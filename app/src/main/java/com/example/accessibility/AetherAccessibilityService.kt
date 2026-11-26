@@ -431,7 +431,7 @@ class AetherAccessibilityService : AccessibilityService() {
     }
 
     fun clickNodeByAnyText(candidates: List<String>, minYNorm: Int = 0, maxYNorm: Int = 1000): Boolean {
-        val (_, items) = collectIndexedCandidates()
+        val items = collectAllWindowCandidates()
         for (query in candidates) {
             val clean = query.trim()
             if (clean.isBlank()) continue
@@ -457,49 +457,209 @@ class AetherAccessibilityService : AccessibilityService() {
         return false
     }
 
+    fun dismissSoftKeyboardIfBlocking(): Boolean {
+        val imeVisible = runCatching { windows }.getOrDefault(emptyList())
+            .any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD && it.isActive }
+        return if (imeVisible) {
+            performGlobalAction(GLOBAL_ACTION_BACK)
+        } else {
+            false
+        }
+    }
+
+    fun dismissBlockingPopupIfPresent(): String? {
+        val items = collectAllWindowCandidates()
+        val forbidden = listOf("discard", "delete", "log out", "remove", "block", "report", "uninstall")
+        val safeDismiss = listOf(
+            "Not now", "No thanks", "Skip for now", "Skip", "Maybe later", "Later",
+            "Keep editing", "Got it", "While using the app", "Only this time",
+            "Allow", "Continue", "OK", "Close", "Dismiss"
+        )
+        // Confirm an overlay/modal feel exists so we don't blindly tap feed links named "Continue"
+        val hasDialogCue = items.any { (c, _) ->
+            val combined = "${c.text} ${c.contentDesc}".lowercase()
+            combined.contains("not now") ||
+                combined.contains("keep editing") ||
+                combined.contains("discard") ||
+                combined.contains("allow ") ||
+                combined.contains("turn on") ||
+                combined.contains("got it") ||
+                combined.contains("save login") ||
+                combined.contains("contacts") ||
+                combined.contains("location")
+        }
+        if (!hasDialogCue) return null
+
+        for (label in safeDismiss) {
+            val match = items.firstOrNull { (c, _) ->
+                val raw = c.text.ifBlank { c.contentDesc }.trim()
+                val lower = raw.lowercase()
+                lower.isNotBlank() &&
+                    forbidden.none { lower.contains(it) } &&
+                    (c.isClickable || c.cyNorm in 300..930) &&
+                    (lower == label.lowercase() || lower.contains(label.lowercase()))
+            }
+            if (match != null && clickSelfOrParent(match.second)) {
+                return label
+            }
+        }
+        return null
+    }
+
     fun clickBestFacebookComposer(): Boolean {
         val prompts = listOf(
             "What's on your mind?",
             "What’s on your mind?",
             "Write something here",
+            "Write something...",
             "Create a public post",
             "Create post",
+            "Share an update",
             "আপনার মনে কী আছে",
             "কী ভাবছেন"
         )
-        if (clickNodeByAnyText(prompts, minYNorm = 80, maxYNorm = 650)) {
+        if (clickNodeByAnyText(prompts, minYNorm = 70, maxYNorm = 720)) {
             return true
         }
-        val (_, items) = collectIndexedCandidates()
+        val items = collectAllWindowCandidates()
         val editableOrHint = items.firstOrNull { (c, _) ->
-            c.cyNorm in 120..520 && (c.isEditable || c.hint.isNotBlank())
+            c.cyNorm in 100..560 && (c.isEditable || c.hint.isNotBlank() ||
+                c.viewIdSuffix.contains("composer", ignoreCase = true) ||
+                c.contentDesc.contains("create", ignoreCase = true))
         }
         return editableOrHint?.let { clickSelfOrParent(it.second) } ?: false
     }
 
+    fun isSocialComposerStillOpen(): Boolean {
+        val items = collectAllWindowCandidates()
+        return items.any { (c, _) ->
+            c.isEditable && c.cyNorm in 80..760 && (
+                c.hint.contains("mind", ignoreCase = true) ||
+                    c.hint.contains("say", ignoreCase = true) ||
+                    c.hint.contains("post", ignoreCase = true) ||
+                    c.hint.contains("write", ignoreCase = true) ||
+                    c.text.isNotBlank()
+                )
+        } || items.any { (c, _) ->
+            val combined = "${c.text} ${c.contentDesc}".trim()
+            combined.equals("Create post", ignoreCase = true) ||
+                combined.equals("Post settings", ignoreCase = true) ||
+                combined.equals("Who can see your post?", ignoreCase = true)
+        }
+    }
+
     fun inputSocialComposerText(postText: String): Boolean {
-        val (_, items) = collectIndexedCandidates()
+        val items = collectAllWindowCandidates()
         val bestEditable = items.firstOrNull { (c, _) ->
             c.isEditable && (
                 c.hint.contains("mind", ignoreCase = true) ||
                     c.hint.contains("say", ignoreCase = true) ||
                     c.hint.contains("post", ignoreCase = true) ||
                     c.hint.contains("write", ignoreCase = true) ||
-                    c.cyNorm in 120..700
+                    c.cyNorm in 110..720
                 )
         } ?: items.firstOrNull { it.first.isEditable }
-        if (bestEditable != null) {
-            return setTextOnNode(bestEditable.second, postText, submitEnter = false)
+        if (bestEditable != null && setTextOnNode(bestEditable.second, postText, submitEnter = false)) {
+            return true
         }
         return inputText("", postText, submitSearch = false)
     }
 
+    fun clickFacebookNextOrContinue(): Boolean {
+        val nextLabels = listOf("Next", "NEXT", "পরবর্তী", "Continue", "চালিয়ে যান", "Done")
+        val items = collectAllWindowCandidates()
+        val topRightOrBottom = items.firstOrNull { (c, _) ->
+            val label = c.text.ifBlank { c.contentDesc }.trim()
+            (c.cyNorm <= 250 && c.cxNorm >= 550 || c.cyNorm >= 700) &&
+                nextLabels.any { target -> label.equals(target, ignoreCase = true) }
+        }
+        if (topRightOrBottom != null && clickSelfOrParent(topRightOrBottom.second)) {
+            return true
+        }
+        return clickNodeByAnyText(nextLabels, minYNorm = 35, maxYNorm = 960)
+    }
+
     fun clickBestPublishPostButton(): Boolean {
-        return clickNodeByAnyText(
-            listOf("POST", "Post", "Publish", "Share now", "Share", "পোস্ট করুন", "পোস্ট"),
-            minYNorm = 40,
-            maxYNorm = 950
+        val publishLabels = listOf(
+            "Share now", "Share", "POST", "Post", "Publish",
+            "পোস্ট করুন", "পোস্ট", "শেয়ার করুন", "শেয়ার"
         )
+        val items = collectAllWindowCandidates()
+        // Prioritize explicit header-right or bottom primary CTA buttons over feed 'Share' buttons on existing posts
+        val primaryCta = items.firstOrNull { (c, _) ->
+            val label = c.text.ifBlank { c.contentDesc }.trim()
+            val matchesLabel = publishLabels.any { label.equals(it, ignoreCase = true) }
+            val inPrimaryZone = (c.cyNorm <= 240 && c.cxNorm >= 580) || c.cyNorm >= 760
+            matchesLabel && inPrimaryZone
+        }
+        if (primaryCta != null && clickSelfOrParent(primaryCta.second)) {
+            return true
+        }
+        return clickNodeByAnyText(publishLabels, minYNorm = 40, maxYNorm = 950)
+    }
+
+    private fun collectAllWindowCandidates(
+        maxNodes: Int = 180
+    ): List<Pair<UiNodeCandidate, AccessibilityNodeInfo>> {
+        val merged = mutableListOf<Pair<UiNodeCandidate, AccessibilityNodeInfo>>()
+        val (_, primary) = collectIndexedCandidates(maxNodes = maxNodes)
+        merged.addAll(primary)
+
+        val myPkg = applicationContext.packageName
+        val extraRoots = runCatching { windows }.getOrDefault(emptyList())
+            .mapNotNull { it.root }
+            .filter { r ->
+                val rPkg = r.packageName?.toString().orEmpty()
+                rPkg.isNotBlank() && rPkg != myPkg && r != rootInActiveWindow
+            }
+        val metrics = resources.displayMetrics
+        val screenW = metrics.widthPixels.coerceAtLeast(1)
+        val screenH = metrics.heightPixels.coerceAtLeast(1)
+        for (extra in extraRoots) {
+            collectIndexedInto(extra, screenW, screenH, merged, maxNodes)
+        }
+        return merged
+    }
+
+    private fun collectIndexedInto(
+        node: AccessibilityNodeInfo,
+        screenW: Int,
+        screenH: Int,
+        results: MutableList<Pair<UiNodeCandidate, AccessibilityNodeInfo>>,
+        maxNodes: Int
+    ) {
+        if (results.size >= maxNodes) return
+        val rect = android.graphics.Rect()
+        node.getBoundsInScreen(rect)
+        val text = node.text?.toString()?.trim().orEmpty()
+        val desc = node.contentDescription?.toString()?.trim().orEmpty()
+        val hint = node.hintText?.toString()?.trim().orEmpty()
+        val viewIdSuffix = node.viewIdResourceName?.substringAfterLast('/')?.trim().orEmpty()
+        val interesting = text.isNotBlank() || desc.isNotBlank() || hint.isNotBlank() ||
+            node.isClickable || node.isEditable || node.isScrollable
+        if (interesting && !rect.isEmpty) {
+            val cx = ((rect.centerX().toFloat() / screenW) * 1000f).toInt().coerceIn(0, 1000)
+            val cy = ((rect.centerY().toFloat() / screenH) * 1000f).toInt().coerceIn(0, 1000)
+            results.add(
+                UiNodeCandidate(
+                    index = results.size,
+                    text = text,
+                    contentDesc = desc,
+                    hint = hint,
+                    viewIdSuffix = viewIdSuffix,
+                    isClickable = node.isClickable,
+                    isEditable = node.isEditable,
+                    isScrollable = node.isScrollable,
+                    cxNorm = cx,
+                    cyNorm = cy
+                ) to node
+            )
+        }
+        for (i in 0 until node.childCount) {
+            if (results.size >= maxNodes) break
+            val child = node.getChild(i) ?: continue
+            collectIndexedInto(child, screenW, screenH, results, maxNodes)
+        }
     }
 
     fun clickFirstYouTubeVideoResult(): Boolean {

@@ -16,16 +16,23 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Assistant
+import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -53,14 +60,17 @@ import androidx.compose.ui.unit.dp
 import com.example.ai.AssistantPersona
 import com.example.ai.SpeechLocaleOption
 import com.example.core.AssistantUiState
+import com.example.data.local.SmartTriggerRuleEntity
 import com.example.data.local.VisionTokenMode
 import com.example.data.local.WakeTriggerMode
+import com.example.ui.theme.AlertCoral
 import com.example.ui.theme.DeepCockpit
 import com.example.ui.theme.HudTextPrimary
 import com.example.ui.theme.HudTextSecondary
 import com.example.ui.theme.SmokedGlass
 import com.example.ui.theme.SolarGold
 import com.example.ui.theme.StealthEmerald
+import com.example.ui.theme.VoidObsidian
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -82,7 +92,12 @@ fun SettingsHubSheet(
     onDownloadKwsPack: () -> Unit = {},
     onToggleDeepScreenVision: () -> Unit = {},
     onRequestDefaultAssistant: () -> Unit = {},
-    onSelectVisionTokenMode: (VisionTokenMode) -> Unit = {}
+    onSelectVisionTokenMode: (VisionTokenMode) -> Unit = {},
+    triggerRules: List<SmartTriggerRuleEntity> = emptyList(),
+    onToggleTriggerRule: (Long, Boolean) -> Unit = { _, _ -> },
+    onTestTriggerRule: (SmartTriggerRuleEntity) -> Unit = {},
+    onDeleteTriggerRule: (Long) -> Unit = {},
+    onAddTriggerRule: (String, String, String, String, String, Int) -> Unit = { _, _, _, _, _, _ -> }
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     ModalBottomSheet(
@@ -109,7 +124,12 @@ fun SettingsHubSheet(
             onDownloadKwsPack = onDownloadKwsPack,
             onToggleDeepScreenVision = onToggleDeepScreenVision,
             onRequestDefaultAssistant = onRequestDefaultAssistant,
-            onSelectVisionTokenMode = onSelectVisionTokenMode
+            onSelectVisionTokenMode = onSelectVisionTokenMode,
+            triggerRules = triggerRules,
+            onToggleTriggerRule = onToggleTriggerRule,
+            onTestTriggerRule = onTestTriggerRule,
+            onDeleteTriggerRule = onDeleteTriggerRule,
+            onAddTriggerRule = onAddTriggerRule
         )
     }
 }
@@ -134,7 +154,12 @@ fun SettingsHubContent(
     onDownloadKwsPack: () -> Unit = {},
     onToggleDeepScreenVision: () -> Unit = {},
     onRequestDefaultAssistant: () -> Unit = {},
-    onSelectVisionTokenMode: (VisionTokenMode) -> Unit = {}
+    onSelectVisionTokenMode: (VisionTokenMode) -> Unit = {},
+    triggerRules: List<SmartTriggerRuleEntity> = emptyList(),
+    onToggleTriggerRule: (Long, Boolean) -> Unit = { _, _ -> },
+    onTestTriggerRule: (SmartTriggerRuleEntity) -> Unit = {},
+    onDeleteTriggerRule: (Long) -> Unit = {},
+    onAddTriggerRule: (String, String, String, String, String, Int) -> Unit = { _, _, _, _, _, _ -> }
 ) {
     val accent = MaterialTheme.colorScheme.primary
     val prefs = uiState.preferences
@@ -395,13 +420,33 @@ fun SettingsHubContent(
                 iconTint = if (uiState.isDefaultAssistant) StealthEmerald else SolarGold,
                 title = if (uiState.isDefaultAssistant) "Default Digital Assistant Active" else "Set as Default Digital Assistant",
                 subtitle = if (uiState.isDefaultAssistant) {
-                    "Launch Aether via OS power/corner assistant gesture without idle mic"
+                    if (prefs.wakeTriggerMode == WakeTriggerMode.ASSISTANT_BUTTON_ONLY) {
+                        "0-Mic OS Trigger Ready · Launch via power/corner gesture + Floating Overlay"
+                    } else {
+                        "Active · Gesture + foreground Hands-Free Wake enabled"
+                    }
                 } else {
-                    "Tap to grant Android Default Assistant role for instant system launch"
+                    "Tap to grant Android Default Assistant role for floating OS overlay sheet"
                 },
                 onClick = onRequestDefaultAssistant,
                 tag = "default_assistant_card"
             )
+            Spacer(Modifier.height(6.dp))
+            Surface(
+                color = SmokedGlass.copy(alpha = 0.85f),
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, accent.copy(alpha = 0.22f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("os_hotword_explanation_banner")
+            ) {
+                Text(
+                    text = com.example.system.PermissionsManager.OS_HOTWORD_EXPLANATION,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = HudTextSecondary,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                )
+            }
 
             Spacer(Modifier.height(6.dp))
             SettingsSwitchRow(
@@ -544,6 +589,147 @@ fun SettingsHubContent(
                 onToggle = onToggleContinuousLoop,
                 tag = "settings_continuous_loop_switch"
             )
+        }
+
+        // Smart Context Auto-Triggers (Bluetooth, Wi-Fi, Battery)
+        item {
+            HorizontalDivider(color = accent.copy(alpha = 0.18f))
+            Spacer(Modifier.height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Filled.Bolt,
+                    contentDescription = null,
+                    tint = SolarGold,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = "Smart Context Auto-Triggers",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = accent
+                )
+            }
+            Text(
+                text = "Run digests or commands automatically on Bluetooth headset, Wi-Fi, or battery thresholds with cooldown protection.",
+                style = MaterialTheme.typography.bodySmall,
+                color = HudTextSecondary
+            )
+            Spacer(Modifier.height(6.dp))
+
+            var newRuleType by remember { mutableStateOf("WIFI_CONNECTED") }
+            var newRulePrompt by remember { mutableStateOf("") }
+
+            Column(
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.testTag("smart_triggers_section")
+            ) {
+                triggerRules.forEach { rule ->
+                    Surface(
+                        color = SmokedGlass,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (rule.isEnabled) StealthEmerald.copy(alpha = 0.45f) else accent.copy(alpha = 0.22f)
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("trigger_rule_${rule.id}")
+                    ) {
+                        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = rule.name,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = HudTextPrimary
+                                    )
+                                    val condText = if (rule.conditionValue.isNotBlank()) " (${rule.conditionValue})" else ""
+                                    Text(
+                                        text = "${rule.triggerType}$condText · ${rule.cooldownMinutes}m cooldown",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = HudTextSecondary
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { onTestTriggerRule(rule) },
+                                    modifier = Modifier.testTag("test_trigger_${rule.id}")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.PlayArrow,
+                                        contentDescription = "Test trigger rule",
+                                        tint = SolarGold
+                                    )
+                                }
+                                IconButton(
+                                    onClick = { onDeleteTriggerRule(rule.id) },
+                                    modifier = Modifier.testTag("delete_trigger_${rule.id}")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.DeleteOutline,
+                                        contentDescription = "Delete trigger rule",
+                                        tint = AlertCoral
+                                    )
+                                }
+                                Switch(
+                                    checked = rule.isEnabled,
+                                    onCheckedChange = { enabled -> onToggleTriggerRule(rule.id, enabled) }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                // Quick Add Trigger Rule row
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(
+                        "BLUETOOTH_CONNECTED" to "Bluetooth",
+                        "WIFI_CONNECTED" to "Wi-Fi",
+                        "BATTERY_LOW" to "Battery <=20%"
+                    ).forEach { (typeKey, label) ->
+                        FilterChip(
+                            selected = newRuleType == typeKey,
+                            onClick = { newRuleType = typeKey },
+                            label = { Text(label, style = MaterialTheme.typography.labelSmall) }
+                        )
+                    }
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    OutlinedTextField(
+                        value = newRulePrompt,
+                        onValueChange = { newRulePrompt = it },
+                        placeholder = { Text("Action prompt (or leave blank for Digest)") },
+                        singleLine = true,
+                        modifier = Modifier.weight(1f)
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            val mode = if (newRulePrompt.isBlank()) "SPEAK_NOTIFICATION_DIGEST" else "RUN_PROMPT_COMMAND"
+                            val ruleName = when (newRuleType) {
+                                "BLUETOOTH_CONNECTED" -> "BT Audio Rule"
+                                "WIFI_CONNECTED" -> "Wi-Fi Connected Rule"
+                                else -> "Battery Alert Rule"
+                            }
+                            val cond = if (newRuleType == "BATTERY_LOW") "20" else ""
+                            onAddTriggerRule(ruleName, newRuleType, cond, mode, newRulePrompt, 15)
+                            newRulePrompt = ""
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = accent, contentColor = VoidObsidian),
+                        modifier = Modifier.testTag("add_trigger_rule_button")
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = "Add smart trigger rule")
+                    }
+                }
+            }
         }
 
         // Speech Recognition Language

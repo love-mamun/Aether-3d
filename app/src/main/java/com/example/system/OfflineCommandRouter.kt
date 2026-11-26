@@ -36,6 +36,11 @@ object OfflineCommandRouter {
         val hasMultiStepIntent = multiStepMarkers.any { marker ->
             lower.contains(marker)
         }
+        val hasCompoundConnector = lower.contains(" and ") ||
+            lower.contains(" then ") ||
+            lower.contains(" এবং ") ||
+            lower.contains(" তারপর ")
+        if (hasCompoundConnector) return null
 
         // 1. Flashlight / Torch
         if (matchesAny(lower, "flash", "torch", "লাইট", "টর্চ", "ফ্ল্যাশ")) {
@@ -218,6 +223,45 @@ object OfflineCommandRouter {
                     )
                 )
             }
+        }
+
+        // 8.5 Unread Notification Digest ("read my notifications", "unread messages", "নোটিফিকেশন পড়ো")
+        if (matchesAny(lower, "notification", "notifications", "unread message", "unread alert", "নোটিফিকেশন", "মেসেজ পড়ো", "মেসেজ পড়ো") &&
+            !lower.contains("reply") && !lower.contains("send") && !lower.contains("রিপ্লাই") &&
+            !lower.contains(" and ") && !lower.contains(" then ") && !lower.contains(" ar ")
+        ) {
+            val preferBangla = clean.any { it in '\u0980'..'\u09FF' }
+            return OfflineMatchResult(
+                label = "Offline · Unread Digest",
+                plan = CommandPlan(
+                    reply = "Checking unread notifications.",
+                    steps = listOf(
+                        PlannedStep(
+                            actionType = ActionType.READ_NOTIFICATIONS,
+                            label = "Unread Notification Digest",
+                            textPayload = if (preferBangla) "bn" else "en",
+                            isBackgroundParallel = true
+                        )
+                    )
+                )
+            )
+        }
+
+        // 8.6 Live Camera Vision Lens ("open camera lens", "vision lens", "ক্যামেরা লেন্স")
+        if (matchesAny(lower, "camera lens", "vision lens", "live lens", "look through camera", "ক্যামেরা লেন্স")) {
+            return OfflineMatchResult(
+                label = "Offline · Vision Lens",
+                plan = CommandPlan(
+                    reply = "Opening Live Vision Lens.",
+                    steps = listOf(
+                        PlannedStep(
+                            actionType = ActionType.OPEN_CAMERA_LENS,
+                            label = "Open Vision Lens",
+                            target = clean
+                        )
+                    )
+                )
+            )
         }
 
         // 9. Simple pure app launch ("open YouTube", "open Dial", "Facebook khulo") — only when single goal!

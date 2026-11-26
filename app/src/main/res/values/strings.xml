@@ -16,4 +16,7 @@
     <string name="screen_vision_title">Deep Screen Vision Active</string>
     <string name="screen_vision_subtitle">Ready to capture screen frames on your command</string>
     <string name="action_stop_vision">Stop Vision</string>
+    <string name="voice_interaction_service_label">Aether 3D Digital Assistant</string>
+    <string name="notification_listener_label">Aether 3D Notification Copilot</string>
+    <string name="lens_camera_title">Aether Vision Lens</string>
 </resources>

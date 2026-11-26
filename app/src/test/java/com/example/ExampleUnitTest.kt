@@ -1163,4 +1163,152 @@ class ExampleUnitTest {
     assertEquals(500, playTap?.step?.intValue)
     assertEquals(420, playTap?.step?.secondaryIntValue)
   }
+
+  @Test
+  fun screenLoopGuard_distinguishesFacebookFromFacebookLite() {
+    val fbKeywords = com.example.core.ScreenLoopGuard.expectedPackageKeywords("Facebook")
+    assertTrue(fbKeywords.contains("katana"))
+    assertFalse(fbKeywords.contains("facebook.lite"))
+
+    val fbLiteKeywords = com.example.core.ScreenLoopGuard.expectedPackageKeywords("Facebook Lite")
+    assertTrue(fbLiteKeywords.contains("facebook.lite"))
+    assertFalse(fbLiteKeywords.contains("katana"))
+
+    val msgLiteKeywords = com.example.core.ScreenLoopGuard.expectedPackageKeywords("Messenger Lite")
+    assertTrue(msgLiteKeywords.contains("mlite"))
+  }
+
+  @Test
+  fun offlineScreenEngine_resolvesAudienceShareNextPopupsAndLiteVisionFallback() {
+    // 1. Facebook Lite triggers compact Vision fallback even in OFFLINE_FIRST
+    val liteAnalysis = com.example.vision.OfflineScreenUnderstandingEngine.buildOfflineAnalysis(
+      packageName = "com.facebook.lite",
+      rawUiSummary = "Foreground package: com.facebook.lite (1080x2400)",
+      nodeCount = 2,
+      ocrLines = listOf(com.example.vision.OcrLineItem("Next", 900, 110)),
+      ocrSummary = "",
+      visualLabels = listOf("Mobile phone"),
+      detectedObjects = emptyList(),
+      userPrompt = "Facebook Lite a post koro Hey guys I am Aether",
+      visionTokenMode = com.example.data.local.VisionTokenMode.OFFLINE_FIRST,
+      hasSourceBitmap = true
+    )
+    assertTrue(com.example.vision.OfflineScreenUnderstandingEngine.isLiteOrCanvasApp("com.facebook.lite"))
+    assertTrue("Lite app should attach compact Vision crop", liteAnalysis.shouldAttachBitmapToCloud)
+
+    // 2. Audience/Share stage classifies and resolves 'Share' offline without touching Discard
+    val shareUi = """
+      Foreground package: com.facebook.katana (1080x2400)
+      [500,120|top] "Post settings"
+      [250,310|mid] (click) "Public"
+      [500,520|mid] (click) "Discard post"
+      [880,920|bot] (click) "Share now"
+    """.trimIndent()
+    val shareAnalysis = com.example.vision.OfflineScreenUnderstandingEngine.buildOfflineAnalysis(
+      packageName = "com.facebook.katana",
+      rawUiSummary = shareUi,
+      nodeCount = 4,
+      ocrLines = emptyList(),
+      ocrSummary = "",
+      visualLabels = listOf("Screenshot"),
+      detectedObjects = emptyList(),
+      userPrompt = "Write a post on Facebook Hey guys I am Aether",
+      visionTokenMode = com.example.data.local.VisionTokenMode.OFFLINE_FIRST,
+      hasSourceBitmap = false
+    )
+    assertEquals(com.example.vision.ScreenSceneType.AUDIENCE_OR_SHARE_STAGE, shareAnalysis.sceneType)
+    val shareHop = com.example.vision.OfflineScreenUnderstandingEngine.tryResolveNextHopOffline(
+      activeSubGoal = "Tap Next or Share",
+      userPrompt = "Write a post on Facebook Hey guys I am Aether",
+      analysis = shareAnalysis
+    )
+    assertNotNull(shareHop)
+    assertEquals(880, shareHop?.step?.intValue)
+    assertEquals(920, shareHop?.step?.secondaryIntValue)
+
+    // 3. Blocking popup dismisses cleanly using 'Not now'
+    val popupUi = """
+      Foreground package: com.facebook.lite (1080x2400)
+      [500,400|mid] "Save login info?"
+      [350,620|mid] (click) "Not now"
+      [680,620|mid] (click) "Save"
+    """.trimIndent()
+    val popupAnalysis = com.example.vision.OfflineScreenUnderstandingEngine.buildOfflineAnalysis(
+      packageName = "com.facebook.lite",
+      rawUiSummary = popupUi,
+      nodeCount = 3,
+      ocrLines = emptyList(),
+      ocrSummary = "",
+      visualLabels = emptyList(),
+      detectedObjects = emptyList(),
+      userPrompt = "Facebook Lite a post koro",
+      visionTokenMode = com.example.data.local.VisionTokenMode.OFFLINE_FIRST,
+      hasSourceBitmap = false
+    )
+    assertEquals(com.example.vision.ScreenSceneType.DIALOG_MODAL, popupAnalysis.sceneType)
+    val dismissHop = com.example.vision.OfflineScreenUnderstandingEngine.tryResolveNextHopOffline(
+      activeSubGoal = "Complete action",
+      userPrompt = "Facebook Lite a post koro",
+      analysis = popupAnalysis
+    )
+    assertNotNull(dismissHop)
+    assertEquals(350, dismissHop?.step?.intValue)
+  }
+
+  @Test
+  fun taskDagExecutor_chainsStepOutputPlaceholdersRetriesAndOrdersPostSocial() = kotlinx.coroutines.runBlocking {
+    val executor = com.example.core.TaskDagExecutor()
+    val steps = listOf(
+      com.example.ai.PlannedStep(
+        stepId = "s0",
+        actionType = com.example.ai.ActionType.WEATHER_LOOKUP,
+        label = "Fetch weather",
+        target = "Dhaka",
+        isBackgroundParallel = true
+      ),
+      com.example.ai.PlannedStep(
+        stepId = "s1",
+        actionType = com.example.ai.ActionType.POST_SOCIAL,
+        label = "Post on Facebook Lite",
+        target = "Facebook Lite",
+        textPayload = "Weather right now: {{s0}}",
+        dependsOn = listOf("s0")
+      )
+    )
+    val nodes = executor.buildDag(steps)
+    assertEquals(70_000L, nodes[1].timeoutMs)
+
+    var s0Attempts = 0
+    var capturedSocialText = ""
+    val summary = executor.executeDag(
+      nodes = nodes,
+      onTaskUpdate = { _, _, _, _, _ -> },
+      onTorchStateChanged = {},
+      executor = { step ->
+        when (step.stepId) {
+          "s0" -> {
+            s0Attempts++
+            if (s0Attempts == 1) {
+              com.example.system.ActionExecutionResult(false, "Transient network hiccup")
+            } else {
+              com.example.system.ActionExecutionResult(
+                success = true,
+                detail = "30°C Sunny in Dhaka",
+                toolOutputForSummary = "30°C Sunny in Dhaka"
+              )
+            }
+          }
+          else -> {
+            capturedSocialText = step.textPayload
+            com.example.system.ActionExecutionResult(true, "Posted", toolOutputForSummary = "Posted on Facebook Lite")
+          }
+        }
+      }
+    )
+
+    assertEquals(2, s0Attempts)
+    assertEquals(2, summary.completedCount)
+    assertEquals(0, summary.failedCount)
+    assertEquals("Weather right now: 30°C Sunny in Dhaka", capturedSocialText)
+  }
 }

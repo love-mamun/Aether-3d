@@ -201,6 +201,41 @@ class AndroidActionRouter(
                 val ok = svc.performSystemGlobalAction(action)
                 ActionExecutionResult(ok, if (ok) "Executed OS action: $action" else "Unsupported OS action ($action)")
             }
+
+            ActionType.READ_NOTIFICATIONS -> {
+                val preferBangla = step.textPayload.equals("bn", ignoreCase = true) ||
+                    step.label.any { it in '\u0980'..'\u09FF' }
+                val digest = com.example.notifications.NotificationCopilotStore.buildSpokenDigest(
+                    preferBangla = preferBangla
+                )
+                ActionExecutionResult(true, digest, toolOutputForSummary = digest)
+            }
+
+            ActionType.REPLY_NOTIFICATION -> {
+                val query = step.recipient.ifBlank { step.target }.trim()
+                val cluster = com.example.notifications.NotificationCopilotStore.findClusterByQuery(query)
+                    ?: return ActionExecutionResult(
+                        false,
+                        "No reply-ready unread notification found${if (query.isNotBlank()) " for $query" else ""}."
+                    )
+                val body = step.textPayload.trim()
+                if (body.isBlank()) {
+                    return ActionExecutionResult(false, "Reply message text is empty.")
+                }
+                val result = com.example.notifications.NotificationCopilotStore.dispatchRemoteReply(
+                    context = context,
+                    clusterId = cluster.clusterId,
+                    replyText = body
+                )
+                result.fold(
+                    onSuccess = { msg -> ActionExecutionResult(true, msg, toolOutputForSummary = msg) },
+                    onFailure = { err -> ActionExecutionResult(false, err.localizedMessage ?: "Quick reply failed") }
+                )
+            }
+
+            ActionType.OPEN_CAMERA_LENS -> {
+                ActionExecutionResult(true, "Vision Lens active.")
+            }
         }
     }
 

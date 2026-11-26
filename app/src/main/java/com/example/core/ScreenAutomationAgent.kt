@@ -86,7 +86,7 @@ internal object MultiStepGoalClassifier {
 }
 
 internal object ScreenLoopGuard {
-    const val MAX_SCREEN_LOOP_ITERATIONS = 12
+    const val MAX_SCREEN_LOOP_ITERATIONS = 16
     const val MAX_SCROLL_SWEEPS = 6
     const val MAX_CONSECUTIVE_STALLS = 4
 
@@ -107,9 +107,11 @@ internal object ScreenLoopGuard {
         val clean = appName.trim().lowercase(Locale.US)
         return when {
             clean.contains("whatsapp") -> listOf("whatsapp")
-            clean.contains("facebook") -> listOf("katana", "facebook", "lite")
+            clean.contains("facebook") && clean.contains("lite") -> listOf("facebook.lite", "lite")
+            clean.contains("facebook") -> listOf("katana", "facebook")
             clean.contains("youtube") -> listOf("youtube")
             clean.contains("telegram") -> listOf("telegram", "nekogram")
+            clean.contains("messenger") && clean.contains("lite") -> listOf("mlite", "messenger")
             clean.contains("messenger") -> listOf("orca", "messenger")
             clean.contains("instagram") -> listOf("instagram")
             clean.contains("signal") -> listOf("signal")
@@ -384,14 +386,16 @@ class ScreenAutomationAgent(
             ?: return AppMessageOutcome(
                 success = false,
                 needsAccessibilityPermission = true,
-                summary = "Enable Trusted Screen Agent (Accessibility) so Aether can open $appName, write '$postBody', and post it automatically."
+                summary = "Enable Trusted Screen Agent (Accessibility) so Aether can open $appName, write '$postBody', and navigate Next/Share automatically."
             )
 
         if (postBody.isBlank()) {
             return AppMessageOutcome(false, "Tell me what text you want to post on $appName.")
         }
 
-        // 1/4: Launch Facebook & wait for feed to clear splash screen
+        val isLiteTarget = appName.contains("lite", ignoreCase = true)
+
+        // Stage 1: Launch exact app (Facebook vs Facebook Lite) & clear splash / popups
         onStepProgress("1/4 · Opening $appName...")
         val launchRes = actionRouter.launchAppByName(appName, splitScreenEnabled)
         if (!launchRes.success) {
@@ -399,18 +403,26 @@ class ScreenAutomationAgent(
         }
         val pkgKeywords = ScreenLoopGuard.expectedPackageKeywords(appName)
         accessibility.waitForNonSplashUi(pkgKeywords, timeoutMs = 6_500L)
-        delay(800L)
+        delay(850L)
         currentCoroutineContext().ensureActive()
 
-        // 2/4: Tap 'What's on your mind?' / 'Create post' composer trigger
-        onStepProgress("2/4 · Opening post composer...")
+        accessibility.dismissBlockingPopupIfPresent()?.let { dismissed ->
+            onStepProgress("Dismissed '$dismissed' dialog in $appName...")
+            delay(550L)
+        }
+
+        // Stage 2: Open post composer (Tree -> Lite OCR/Vision fallback)
+        onStepProgress("2/4 · Opening $appName post composer...")
         var composerOpened = false
-        if (accessibility.clickBestFacebookComposer()) {
-            delay(1_100L)
-            composerOpened = true
-        } else {
+        for (attempt in 1..2) {
+            if (accessibility.isSocialComposerStillOpen() || accessibility.clickBestFacebookComposer()) {
+                delay(1_050L)
+                composerOpened = true
+                break
+            }
+            accessibility.dismissBlockingPopupIfPresent()
             val visionOpen = runSingleVisionStep(
-                goalInstruction = "We are inside $appName. Tap the 'What's on your mind?' or 'Create post' button/box to open the post composer.",
+                goalInstruction = "We are inside $appName. Tap the 'What's on your mind?', 'Write something...', or 'Create post' composer trigger button so the text editor opens. If a popup blocks it, dismiss the popup with Not now / Skip.",
                 persona = persona,
                 deviceContextSummary = deviceContextSummary,
                 memoriesSummary = memoriesSummary,
@@ -420,28 +432,33 @@ class ScreenAutomationAgent(
                 preferNvidiaPrimary = preferNvidiaPrimary,
                 splitScreenEnabled = splitScreenEnabled,
                 onStreamingReply = onStreamingReply,
-                onActiveModelChanged = onActiveModelChanged
+                onActiveModelChanged = onActiveModelChanged,
+                visionTokenMode = VisionTokenMode.HYBRID_COMPACT,
+                forceCloudEscalation = isLiteTarget || attempt >= 2
             )
             if (visionOpen.executedAnyAction) {
-                delay(1_100L)
+                delay(1_150L)
                 composerOpened = true
+                break
             }
         }
 
         if (!composerOpened) {
             return AppMessageOutcome(
                 success = false,
-                summary = "Opened $appName, but couldn't locate the 'What's on your mind?' post box."
+                summary = "Opened $appName, but couldn't locate the post composer box."
             )
         }
 
-        // 3/4: Enter the post text
+        // Stage 3: Enter post body text (Tree -> Vision fallback)
         currentCoroutineContext().ensureActive()
         onStepProgress("3/4 · Writing post: \"$postBody\"...")
-        val typed = accessibility.inputSocialComposerText(postBody)
+        var typed = accessibility.inputSocialComposerText(postBody)
         if (!typed) {
+            delay(450L)
+            accessibility.dismissBlockingPopupIfPresent()
             val visionType = runSingleVisionStep(
-                goalInstruction = "We are in $appName post composer. Use UI_INPUT_TEXT to type '$postBody' into the post text box.",
+                goalInstruction = "We are inside $appName post composer. Use UI_INPUT_TEXT to type '$postBody' into the post text box (or tap the post text box first if needed).",
                 persona = persona,
                 deviceContextSummary = deviceContextSummary,
                 memoriesSummary = memoriesSummary,
@@ -451,28 +468,87 @@ class ScreenAutomationAgent(
                 preferNvidiaPrimary = preferNvidiaPrimary,
                 splitScreenEnabled = splitScreenEnabled,
                 onStreamingReply = onStreamingReply,
-                onActiveModelChanged = onActiveModelChanged
+                onActiveModelChanged = onActiveModelChanged,
+                visionTokenMode = VisionTokenMode.HYBRID_COMPACT,
+                forceCloudEscalation = true
             )
-            if (!visionType.executedAnyAction) {
-                return AppMessageOutcome(
-                    success = false,
-                    summary = "Opened $appName composer, but couldn't type the post text."
-                )
-            }
+            typed = visionType.executedAnyAction
+        }
+
+        if (!typed) {
+            return AppMessageOutcome(
+                success = false,
+                summary = "Opened $appName composer, but couldn't type the post text."
+            )
         }
 
         if (!autoPost) {
             return AppMessageOutcome(true, "Wrote '$postBody' in $appName composer ready to post.")
         }
 
-        // 4/4: Tap Post / Publish automatically
-        delay(550L)
-        currentCoroutineContext().ensureActive()
-        onStepProgress("4/4 · Publishing post on $appName...")
-        var published = accessibility.clickBestPublishPostButton()
-        if (!published) {
-            val visionPost = runSingleVisionStep(
-                goalInstruction = "The post text '$postBody' is entered in $appName composer. Tap the blue 'Post' or 'Share' button at top-right now.",
+        // Stage 4: Multi-screen progression solver (Next/Continue -> Audience/Modal -> Share/Post)
+        onStepProgress("4/4 · Completing Next / Share flow in $appName...")
+        var sawFinalPublishTap = false
+        var tappedNext = false
+
+        for (stage in 1..6) {
+            currentCoroutineContext().ensureActive()
+            delay(if (stage == 1) 600L else 950L)
+
+            // Dismiss any popup modal (Audience promo, Save info, etc.) without touching Discard
+            accessibility.dismissBlockingPopupIfPresent()?.let { dismissed ->
+                onStepProgress("4/4 · Cleared '$dismissed' modal...")
+                delay(500L)
+            }
+
+            // Try direct Publish/Share first if we are past intermediate Next or Publish button is ready
+            if (accessibility.clickBestPublishPostButton()) {
+                sawFinalPublishTap = true
+                delay(1_100L)
+                // If composer exited and no confirmation dialog stays up, we are done!
+                if (!accessibility.isSocialComposerStillOpen()) {
+                    break
+                }
+                // Check if another Next/Share confirmation screen appeared
+                accessibility.dismissBlockingPopupIfPresent()
+                continue
+            }
+
+            // Facebook & Lite often show 'Next' at top-right or bottom BEFORE reaching 'Share' / 'Post'
+            if (accessibility.clickFacebookNextOrContinue()) {
+                tappedNext = true
+                onStepProgress("4/4 · Tapped Next -> waiting for Share screen...")
+                delay(1_050L)
+                continue
+            }
+
+            // Dismiss soft keyboard if it hides the bottom CTA bar on small screens / Lite apps
+            if (stage == 2 && accessibility.dismissSoftKeyboardIfBlocking()) {
+                onStepProgress("4/4 · Hidden keyboard to reveal Share/Post...")
+                delay(500L)
+                if (accessibility.clickBestPublishPostButton()) {
+                    sawFinalPublishTap = true
+                    delay(1_000L)
+                    if (!accessibility.isSocialComposerStillOpen()) break
+                }
+                if (accessibility.clickFacebookNextOrContinue()) {
+                    tappedNext = true
+                    delay(950L)
+                    continue
+                }
+            }
+
+            // Cloud Vision escalation (always compact <=512px crop on Lite apps or stage >= 2)
+            onStepProgress("4/4 · Checking $appName screen with Vision ($stage/6)...")
+            val visionTurn = runSingleVisionStep(
+                goalInstruction = buildString {
+                    appendLine("We already wrote the post '$postBody' inside $appName (tappedNext=$tappedNext).")
+                    appendLine("Inspect the current screen and execute the exact button to advance or finish posting:")
+                    appendLine("- If you see 'Next', 'পরবর্তী', 'Continue', or 'Done', tap it now (UI_TAP_COORDINATES or UI_TAP_TEXT) with continueLoopAfterAction=true.")
+                    appendLine("- If you see 'Share', 'Share now', 'Post', 'Publish', or 'পোস্ট', tap it now to publish the post!")
+                    appendLine("- If a modal dialog/popup is blocking, tap 'Not now', 'Skip', 'Keep editing', or 'Allow' (NEVER tap Discard).")
+                    appendLine("- If the post is already published and we returned to the home feed, emit SPEAK_ONLY with continueLoopAfterAction=false.")
+                },
                 persona = persona,
                 deviceContextSummary = deviceContextSummary,
                 memoriesSummary = memoriesSummary,
@@ -482,16 +558,31 @@ class ScreenAutomationAgent(
                 preferNvidiaPrimary = preferNvidiaPrimary,
                 splitScreenEnabled = splitScreenEnabled,
                 onStreamingReply = onStreamingReply,
-                onActiveModelChanged = onActiveModelChanged
+                onActiveModelChanged = onActiveModelChanged,
+                visionTokenMode = VisionTokenMode.CLOUD_VISION,
+                forceCloudEscalation = true
             )
-            published = visionPost.executedAnyAction
+            if (visionTurn.executedLabels.any { lbl ->
+                    lbl.contains("share", ignoreCase = true) ||
+                        lbl.contains("post", ignoreCase = true) ||
+                        lbl.contains("publish", ignoreCase = true)
+                }
+            ) {
+                sawFinalPublishTap = true
+            }
+            if (!visionTurn.executedAnyAction && !visionTurn.shouldContinue) {
+                if (!accessibility.isSocialComposerStillOpen()) {
+                    sawFinalPublishTap = true
+                }
+                break
+            }
         }
 
-        return if (published) {
-            delay(500L)
+        val leftComposer = !accessibility.isSocialComposerStillOpen()
+        return if (sawFinalPublishTap || leftComposer) {
             AppMessageOutcome(true, "Posted '$postBody' on $appName.")
         } else {
-            AppMessageOutcome(false, "Typed '$postBody' on $appName, tap Post to finish.")
+            AppMessageOutcome(false, "Entered '$postBody' in $appName; tap Next/Share to finish.")
         }
     }
 
@@ -674,6 +765,8 @@ class ScreenAutomationAgent(
             ?: when {
                 userPrompt.contains("youtube", ignoreCase = true) || userPrompt.contains("ইউটিউব") -> "YouTube"
                 userPrompt.contains("whatsapp", ignoreCase = true) -> "WhatsApp"
+                userPrompt.contains("facebook lite", ignoreCase = true) ||
+                    userPrompt.contains("fb lite", ignoreCase = true) -> "Facebook Lite"
                 userPrompt.contains("facebook", ignoreCase = true) -> "Facebook"
                 else -> ""
             }
@@ -697,7 +790,7 @@ class ScreenAutomationAgent(
 
         for (stepIdx in 1..ScreenLoopGuard.MAX_SCREEN_LOOP_ITERATIONS) {
             currentCoroutineContext().ensureActive()
-            delay(850L)
+            delay(800L)
 
             val preSnap = accessibility.captureFullScreenContext(includeBitmap = false)
             if (preSnap?.isLoading == true) {
@@ -708,6 +801,18 @@ class ScreenAutomationAgent(
                     visionSource = preSnap.visionSource
                 )
                 accessibility.waitForContentReady(timeoutMs = 3_500L)
+            }
+
+            // Proactive popup dismissal so permission/promo modals never stall multi-step loops
+            accessibility.dismissBlockingPopupIfPresent()?.let { dismissedLabel ->
+                completedStepNotes.add("Dismissed modal '$dismissedLabel'")
+                emitProgress(
+                    stepIdx,
+                    "Step $stepIdx · Dismissed '$dismissedLabel'",
+                    waitingForLoad = true,
+                    visionSource = "POPUP"
+                )
+                delay(650L)
             }
 
             emitProgress(
@@ -721,7 +826,16 @@ class ScreenAutomationAgent(
             val (nextStall, stalled) = ScreenLoopGuard.evaluateStall(previousSig, currentSig, stallCount)
             stallCount = nextStall
             previousSig = currentSig
-            if (stalled && stepIdx > 2) {
+
+            if (stallCount == 2) {
+                // Recovery attempt: hide blocking soft keyboard or scroll gently before giving up
+                val recovered = accessibility.dismissSoftKeyboardIfBlocking() ||
+                    accessibility.scrollScreen("down")
+                if (recovered) {
+                    delay(700L)
+                }
+            }
+            if (stalled && stepIdx > 3) {
                 break
             }
 
@@ -735,6 +849,9 @@ class ScreenAutomationAgent(
             }.joinToString("\n")
 
             val activeSubGoal = checklist.getOrElse(activeSubGoalIdx) { userPrompt }
+            val escalateVision = stallCount >= 1 ||
+                OfflineScreenUnderstandingEngine.isLiteOrCanvasApp(preSnap?.packageName.orEmpty())
+
             val turnResult = runSingleVisionStep(
                 goalInstruction = buildString {
                     appendLine("ORIGINAL USER GOAL: $userPrompt")
@@ -744,7 +861,8 @@ class ScreenAutomationAgent(
                         appendLine("COMPLETED: ${completedStepNotes.joinToString(" -> ")}")
                     }
                     appendLine(
-                        "Execute ONLY the next UI action (UI_TAP_TEXT, UI_TAP_COORDINATES, UI_INPUT_TEXT, UI_SCROLL, or GLOBAL_ACTION) to complete [CURRENT]. " +
+                        "Execute the next 1 to 3 concrete UI actions (UI_TAP_TEXT, UI_TAP_COORDINATES, UI_INPUT_TEXT, UI_SCROLL, or GLOBAL_ACTION) to advance [CURRENT]. " +
+                            "Watch out for multi-screen flows (Next -> Audience -> Share/Post) and dismiss popups safely (Not now/Skip/Allow, NEVER Discard). " +
                             "Set continueLoopAfterAction=true until ALL sub-goals are complete, else SPEAK_ONLY with continueLoopAfterAction=false."
                     )
                 },
@@ -761,7 +879,8 @@ class ScreenAutomationAgent(
                 visionTokenMode = visionTokenMode,
                 rawUserPrompt = userPrompt,
                 activeSubGoal = activeSubGoal,
-                compactLoopMode = true
+                compactLoopMode = true,
+                forceCloudEscalation = escalateVision
             )
 
             if (turnResult.executedLabels.isNotEmpty()) {
@@ -851,7 +970,8 @@ class ScreenAutomationAgent(
         visionTokenMode: VisionTokenMode = VisionTokenMode.OFFLINE_FIRST,
         rawUserPrompt: String = goalInstruction,
         activeSubGoal: String = "",
-        compactLoopMode: Boolean = true
+        compactLoopMode: Boolean = true,
+        forceCloudEscalation: Boolean = false
     ): VisionTurnResult {
         val accessibility = AetherAccessibilityService.currentInstance
             ?: return VisionTurnResult(false, false, emptyList(), "")
@@ -865,19 +985,21 @@ class ScreenAutomationAgent(
                 sourceBitmap = snap.screenshot,
                 prompt = rawUserPrompt,
                 accessibilityNodeCount = snap.nodeCount,
-                forceOcrFallback = visionTokenMode == VisionTokenMode.OFFLINE_FIRST || snap.nodeCount < 8,
+                forceOcrFallback = visionTokenMode == VisionTokenMode.OFFLINE_FIRST || snap.nodeCount < 10,
                 anchorRect = snap.suggestedAnchorRect,
                 packageName = snap.packageName,
                 rawUiSummary = snap.uiSummary,
-                visionTokenMode = visionTokenMode
+                visionTokenMode = visionTokenMode,
+                forceCloudEscalation = forceCloudEscalation
             )
             processedBitmap = processed.croppedBitmap
             ownsProcessedBitmap = processed.ownsCroppedBitmap
             val offlineAnalysis = processed.offlineAnalysis
             val sceneBadge = offlineAnalysis?.summaryBadge.orEmpty()
 
-            // Try 0-token offline resolution first when in OFFLINE_FIRST mode!
-            if (visionTokenMode == VisionTokenMode.OFFLINE_FIRST &&
+            // Try 0-token offline resolution first when not forced to Cloud Vision escalation!
+            if (!forceCloudEscalation &&
+                visionTokenMode == VisionTokenMode.OFFLINE_FIRST &&
                 activeSubGoal.isNotBlank() &&
                 offlineAnalysis != null
             ) {
@@ -964,13 +1086,17 @@ class ScreenAutomationAgent(
                 )
             }
 
+            // Support micro-batches of 1..3 consecutive UI actions cleanly
             val notes = mutableListOf<String>()
             var anySuccess = false
-            for (s in actionable) {
+            for ((idx, s) in actionable.take(3).withIndex()) {
+                if (idx > 0) delay(400L)
                 val res: ActionExecutionResult = actionRouter.executeStep(s, splitScreenEnabled)
                 if (res.success) {
                     anySuccess = true
                     notes.add(res.detail)
+                } else {
+                    break
                 }
             }
             return VisionTurnResult(
@@ -978,7 +1104,7 @@ class ScreenAutomationAgent(
                 shouldContinue = plan.continueLoopAfterAction && anySuccess,
                 executedLabels = notes,
                 planReply = plan.reply,
-                visionSource = if (processedBitmap == null) "OFFLINE+CLOUD TEXT" else snap.visionSource,
+                visionSource = if (processedBitmap == null) "OFFLINE+CLOUD TEXT" else "VISION+${snap.visionSource}",
                 tokensSaved = stepTokensSaved,
                 offlineSceneBadge = sceneBadge
             )
